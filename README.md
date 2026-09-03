@@ -210,7 +210,7 @@ cp .env.example .env.local
 
 ### 2. Clone & Install Dependencies
 ```bash
-git clone https://github.com/your-repo/callflow-ai.git
+git clone https://github.com/Bhavish04/CallFlow_AI
 cd callflow-ai
 npm install
 ```
