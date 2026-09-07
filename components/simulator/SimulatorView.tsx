@@ -18,6 +18,7 @@ import {
   AlertTriangle,
   Mic,
   MicOff,
+  PhoneOff,
   Volume2,
   VolumeX,
   MessageSquare,
@@ -36,6 +37,33 @@ interface SimulatorViewProps {
 type Mode = 'text' | 'voice';
 type VoiceState = 'IDLE' | 'RECORDING' | 'TRANSCRIBING' | 'THINKING' | 'SPEAKING' | 'ERROR';
 
+// Resilient fetch wrapper with explicit timeout protection
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs = 12000
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    return res;
+  } catch (err: any) {
+    if (err.name === 'AbortError') {
+      throw new Error(`Request to ${url} timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function SimulatorView({ workflows }: SimulatorViewProps) {
   const [selectedWorkflowId, setSelectedWorkflowId] = useState<string>(
     workflows.length > 0 ? workflows[0].id : ''
@@ -50,6 +78,13 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
   const [priority, setPriority] = useState<string>('normal');
   const [workflowComplete, setWorkflowComplete] = useState<boolean>(false);
   const [intent, setIntent] = useState<string | null>(null);
+
+  // Synchronization refs to prevent React state closure staleness across async cycles
+  const conversationIdRef = useRef<string | null>(null);
+  const selectedWorkflowIdRef = useRef<string>(workflows.length > 0 ? workflows[0].id : '');
+  const calendarStatusRef = useRef<string>('IDLE');
+  const transcriptRef = useRef<TranscriptMessage[]>([]);
+  const isStartingRecordingRef = useRef<boolean>(false);
 
   // Calendar State
   const [calendarStatus, setCalendarStatus] = useState<string>('IDLE');
@@ -72,7 +107,11 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
   const [initializing, setInitializing] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // Voice Mode State Machine
+  // Voice Mode State Machine & Phone-Call Session State
+  const [voiceSessionActive, setVoiceSessionActive] = useState<boolean>(false);
+  const voiceSessionActiveRef = useRef<boolean>(false);
+  const workflowCompleteRef = useRef<boolean>(false);
+
   const [voiceState, setVoiceState] = useState<VoiceState>('IDLE');
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [ttsUnavailable, setTtsUnavailable] = useState<boolean>(false);
@@ -84,6 +123,38 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
   const recordingSessionIdRef = useRef<number>(0);
   const chatBottomRef = useRef<HTMLDivElement>(null);
 
+  // Web Audio VAD & Silence Detection Refs
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const vadRafIdRef = useRef<number | null>(null);
+  const speechStartedRef = useRef<boolean>(false);
+  const speechStartTimeRef = useRef<number | null>(null);
+  const silenceStartTimeRef = useRef<number | null>(null);
+  const isListeningStoppingRef = useRef<boolean>(false);
+  const [isUserSpeaking, setIsUserSpeaking] = useState<boolean>(false);
+
+  // Calibrated VAD parameters for natural phone-call turn-taking
+  const VAD_SPEECH_RMS_THRESHOLD = 0.024; // Threshold indicating speech above room noise
+  const VAD_SILENCE_DURATION_MS = 1400; // 1.4s natural pause before concluding turn
+  const VAD_MIN_SPEECH_DURATION_MS = 350; // Minimum speech duration to prevent click/cough misfires
+  const VAD_MAX_TURN_DURATION_MS = 25000; // Safeguard: max 25s per single turn
+
+  useEffect(() => {
+    conversationIdRef.current = conversationId;
+  }, [conversationId]);
+
+  useEffect(() => {
+    selectedWorkflowIdRef.current = selectedWorkflowId;
+  }, [selectedWorkflowId]);
+
+  useEffect(() => {
+    calendarStatusRef.current = calendarStatus;
+  }, [calendarStatus]);
+
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  }, [transcript]);
+
   useEffect(() => {
     if (chatBottomRef.current) {
       chatBottomRef.current.scrollIntoView({ behavior: 'smooth' });
@@ -92,9 +163,94 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
 
   const selectedWorkflow = workflows.find((w) => w.id === selectedWorkflowId);
 
+  // Helper to keep state and ref in sync
+  function updateVoiceSessionActive(active: boolean) {
+    voiceSessionActiveRef.current = active;
+    setVoiceSessionActive(active);
+  }
+
+  // TERMINATE ENTIRE VOICE SESSION (End Call)
+  function endVoiceSession() {
+    voiceSessionActiveRef.current = false;
+    setVoiceSessionActive(false);
+    setIsUserSpeaking(false);
+    speechStartedRef.current = false;
+    speechStartTimeRef.current = null;
+    silenceStartTimeRef.current = null;
+    isListeningStoppingRef.current = false;
+    isStartingRecordingRef.current = false;
+
+    // Invalidate any in-flight asynchronous operations, STT, or TTS callbacks
+    recordingSessionIdRef.current++;
+
+    // Cancel VAD animation frame loop
+    if (vadRafIdRef.current) {
+      cancelAnimationFrame(vadRafIdRef.current);
+      vadRafIdRef.current = null;
+    }
+
+    // Disconnect & close AudioContext
+    if (audioContextRef.current) {
+      try {
+        if (audioContextRef.current.state !== 'closed') {
+          audioContextRef.current.close();
+        }
+      } catch (e) {
+        console.warn('Error closing AudioContext on endVoiceSession:', e);
+      }
+      audioContextRef.current = null;
+    }
+    analyserRef.current = null;
+
+    // Stop and cleanup active TTS audio
+    if (activeAudioRef.current) {
+      try {
+        activeAudioRef.current.pause();
+        activeAudioRef.current.currentTime = 0;
+      } catch (e) {
+        console.warn('Error pausing active audio on endVoiceSession:', e);
+      }
+      activeAudioRef.current = null;
+    }
+
+    // Cancel any browser SpeechSynthesis in flight
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch (e) {}
+    }
+
+    // Stop and cleanup MediaRecorder
+    if (mediaRecorderRef.current) {
+      try {
+        if (mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+        }
+      } catch (e) {
+        console.warn('Error stopping MediaRecorder on endVoiceSession:', e);
+      }
+      mediaRecorderRef.current = null;
+    }
+
+    // Clean up and stop all microphone stream tracks
+    if (mediaStreamRef.current) {
+      try {
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      } catch (e) {
+        console.warn('Error stopping stream tracks on endVoiceSession:', e);
+      }
+      mediaStreamRef.current = null;
+    }
+
+    setVoiceState('IDLE');
+  }
+
   // START SIMULATED MISSED CALL
-  async function startSimulation() {
+  async function startSimulation(autoStartVoice = false) {
     if (!selectedWorkflowId) return;
+
+    // Cleanly terminate any active voice session
+    endVoiceSession();
 
     try {
       setInitializing(true);
@@ -102,44 +258,29 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
       setVoiceError(null);
       setTtsUnavailable(false);
       setConversationId(null);
+      conversationIdRef.current = null;
       setTranscript([]);
+      transcriptRef.current = [];
       setCollectedData({});
       setMissingFields([]);
       setPriority('normal');
       setWorkflowComplete(false);
+      workflowCompleteRef.current = false;
       setIntent(null);
       setCalendarStatus('IDLE');
+      calendarStatusRef.current = 'IDLE';
       setCalendarEventId(null);
       setCalendarError(null);
       setBookingTicket(null);
       setVoiceState('IDLE');
 
-      // Cleanup active recording/audio stream
-      recordingSessionIdRef.current++;
-      if (activeAudioRef.current) {
-        activeAudioRef.current.pause();
-        activeAudioRef.current = null;
-      }
-      if (mediaRecorderRef.current) {
-        try {
-          if (mediaRecorderRef.current.state !== 'inactive') mediaRecorderRef.current.stop();
-        } catch {}
-        mediaRecorderRef.current = null;
-      }
-      if (mediaStreamRef.current) {
-        try {
-          mediaStreamRef.current.getTracks().forEach((t) => t.stop());
-        } catch {}
-        mediaStreamRef.current = null;
-      }
-
-      const res = await fetch('/api/ai/chat', {
+      const res = await fetchWithTimeout('/api/ai/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           workflowId: selectedWorkflowId,
         }),
-      });
+      }, 15000);
 
       const data = await res.json();
       if (!res.ok) {
@@ -147,18 +288,31 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
       }
 
       setConversationId(data.conversationId);
+      conversationIdRef.current = data.conversationId;
       setTranscript(data.transcript || []);
+      transcriptRef.current = data.transcript || [];
       setCollectedData(data.collectedData || {});
       setMissingFields(data.missingFields || []);
       setPriority(data.priority || 'normal');
       setWorkflowComplete(data.workflowComplete || false);
+      workflowCompleteRef.current = Boolean(data.workflowComplete);
       setCalendarStatus(data.calendarStatus || 'IDLE');
+      calendarStatusRef.current = data.calendarStatus || 'IDLE';
       setCalendarEventId(data.calendarEventId || null);
       setCalendarError(data.calendarError || null);
 
-      // If in Voice mode, automatically trigger TTS for greeting
-      if (mode === 'voice' && data.reply) {
-        playTtsAudio(data.reply);
+      const shouldStartVoice = mode === 'voice' || autoStartVoice;
+      if (shouldStartVoice) {
+        if (autoStartVoice && mode !== 'voice') {
+          setMode('voice');
+        }
+        updateVoiceSessionActive(true);
+        if (data.reply) {
+          await playTtsAudio(data.reply);
+        } else if (!data.workflowComplete) {
+          console.log('[VOICE] restarting listener');
+          await startRecording();
+        }
       }
     } catch (err: unknown) {
       console.error(err);
@@ -169,16 +323,58 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
     }
   }
 
+  // START CONTINUOUS VOICE CALL (Initiated by single mic click)
+  async function startVoiceCall() {
+    if (voiceSessionActiveRef.current) return;
+
+    const currentConvId = conversationIdRef.current || conversationId;
+    if (!currentConvId) {
+      await startSimulation(true);
+      return;
+    }
+
+    updateVoiceSessionActive(true);
+    setVoiceError(null);
+    setTtsUnavailable(false);
+
+    if (!workflowCompleteRef.current) {
+      console.log('[VOICE] restarting listener');
+      await startRecording();
+    }
+  }
+
   // CORE AI CONVERSATION PIPELINE (Reused by both Text & Voice mode)
-  async function processUserMessage(userText: string) {
-    if (!userText.trim() || !conversationId) return;
+  async function processUserMessage(userText: string, sessionId?: number) {
+    const currentConvId = conversationIdRef.current || conversationId;
+    if (!userText.trim()) return;
+
+    if (!currentConvId) {
+      console.error('[VOICE] processUserMessage called without valid conversationId');
+      if (mode === 'voice') {
+        setVoiceError('Call session not initialized. Reconnecting...');
+        if (voiceSessionActiveRef.current && !workflowCompleteRef.current) {
+          console.log('[VOICE] restarting listener');
+          setTimeout(() => {
+            if (voiceSessionActiveRef.current && !workflowCompleteRef.current) {
+              startRecording();
+            }
+          }, 1000);
+        }
+      }
+      return;
+    }
+
+    if (sessionId !== undefined && (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current)) {
+      console.warn(`[VOICE] Discarding processUserMessage for stale/inactive session #${sessionId}`);
+      return;
+    }
 
     setErrorMsg(null);
     setVoiceError(null);
     setTtsUnavailable(false);
 
     // POST-COMPLETION SAFEGUARD: Stop further AI / Groq / Calendar processing after workflow complete
-    if (workflowComplete) {
+    if (workflowCompleteRef.current) {
       const tempUserMsg: TranscriptMessage = {
         role: 'user',
         content: userText.trim(),
@@ -187,8 +383,9 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
 
       let isHindi = /[\u0900-\u097F]/.test(userText);
       let isHinglish = false;
+      const history = transcriptRef.current.length > 0 ? transcriptRef.current : transcript;
       if (!isHindi) {
-        for (const m of transcript) {
+        for (const m of history) {
           if (m.role === 'user' && /[\u0900-\u097F]/.test(m.content)) {
             isHindi = true;
             break;
@@ -222,10 +419,14 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
         timestamp: new Date().toISOString(),
       };
 
-      setTranscript((prev) => [...prev, tempUserMsg, tempAssistantMsg]);
+      setTranscript((prev) => {
+        const next = [...prev, tempUserMsg, tempAssistantMsg];
+        transcriptRef.current = next;
+        return next;
+      });
       setInputMessage('');
 
-      if (mode === 'voice') {
+      if (mode === 'voice' && voiceSessionActiveRef.current) {
         await playTtsAudio(ackText);
       } else {
         setVoiceState('IDLE');
@@ -238,53 +439,85 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
       content: userText,
       timestamp: new Date().toISOString(),
     };
-    setTranscript((prev) => [...prev, tempUserMsg]);
+    setTranscript((prev) => {
+      const next = [...prev, tempUserMsg];
+      transcriptRef.current = next;
+      return next;
+    });
 
     try {
       if (mode === 'text') setLoading(true);
       if (mode === 'voice') setVoiceState('THINKING');
 
-      const res = await fetch('/api/ai/chat', {
+      console.log('[VOICE] AI request started');
+
+      const res = await fetchWithTimeout('/api/ai/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          workflowId: selectedWorkflowId,
-          conversationId,
+          workflowId: selectedWorkflowIdRef.current || selectedWorkflowId,
+          conversationId: currentConvId,
           message: userText,
-          calendarStatus,
+          calendarStatus: calendarStatusRef.current || calendarStatus,
         }),
-      });
+      }, 15000);
+
+      console.log('[VOICE] AI response received');
+
+      if (sessionId !== undefined && (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current)) {
+        console.warn(`[VOICE] Discarding AI response for stale/inactive session #${sessionId}`);
+        return;
+      }
 
       const data = await res.json();
 
       if (!res.ok) {
-        throw new Error(data.error || 'Failed to get AI response');
+        throw new Error(data.error || `Failed to get AI response (status ${res.status})`);
       }
 
       setTranscript(data.transcript || []);
+      transcriptRef.current = data.transcript || [];
       setCollectedData(data.collectedData || {});
       setMissingFields(data.missingFields || []);
       setPriority(data.priority || 'normal');
       setWorkflowComplete(data.workflowComplete || false);
+      workflowCompleteRef.current = Boolean(data.workflowComplete);
       setIntent(data.intent || null);
       setCalendarStatus(data.calendarStatus || 'IDLE');
+      calendarStatusRef.current = data.calendarStatus || 'IDLE';
       setCalendarEventId(data.calendarEventId || null);
       setCalendarError(data.calendarError || null);
       setBookingTicket(data.bookingTicket || null);
 
       // If in Voice mode, synthesize and play TTS for AI response
-      if (mode === 'voice' && data.reply) {
-        await playTtsAudio(data.reply);
+      if (mode === 'voice' && voiceSessionActiveRef.current) {
+        if (data.reply) {
+          await playTtsAudio(data.reply);
+        } else if (!data.workflowComplete) {
+          console.log('[VOICE] restarting listener');
+          await startRecording();
+        } else {
+          endVoiceSession();
+        }
       } else {
         setVoiceState('IDLE');
       }
     } catch (err: unknown) {
-      console.error(err);
+      console.error('[VOICE] AI request error:', err);
       const msg = err instanceof Error ? err.message : 'Error communicating with AI';
       if (mode === 'text') setErrorMsg(msg);
       if (mode === 'voice') {
-        setVoiceError(msg);
-        setVoiceState('ERROR');
+        setVoiceError(`${msg}. Resuming call...`);
+        setVoiceState('IDLE');
+        // Recoverable AI communication error: if call session is active and not complete, allow speaking again after a pause
+        if (voiceSessionActiveRef.current && !workflowCompleteRef.current) {
+          setTimeout(() => {
+            if (voiceSessionActiveRef.current && (sessionId === undefined || sessionId === recordingSessionIdRef.current) && !workflowCompleteRef.current) {
+              console.log('[VOICE] restarting listener');
+              startRecording();
+            }
+          }, 1500);
+        }
       }
     } finally {
       setLoading(false);
@@ -294,43 +527,136 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
   // TEXT MODE SUBMIT
   function handleTextSubmit(e?: React.FormEvent) {
     if (e) e.preventDefault();
-    if (!inputMessage.trim() || loading || !conversationId) return;
+    const currentConvId = conversationIdRef.current || conversationId;
+    if (!inputMessage.trim() || loading || !currentConvId) return;
 
     const userText = inputMessage.trim();
     setInputMessage('');
     processUserMessage(userText);
   }
 
-  // VOICE MODE: PLAY TTS AUDIO (PROMISE WRAPPED & LEAK PROOF)
+  // VOICE MODE: PLAY TTS AUDIO (PROMISE WRAPPED, LEAK-PROOF, STRICT MICROPHONE ISOLATION)
   async function playTtsAudio(textToSpeak: string): Promise<void> {
+    const sessionId = recordingSessionIdRef.current;
+
     try {
       setVoiceState('SPEAKING');
+      console.log('[VOICE] TTS request started');
 
-      const res = await fetch('/api/voice/speak', {
+      const res = await fetchWithTimeout('/api/voice/speak', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: textToSpeak }),
-      });
+      }, 12000);
+
+      console.log('[VOICE] TTS response received');
+
+      // If call session was terminated while awaiting TTS response, abort immediately
+      if (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
+        setVoiceState('IDLE');
+        return;
+      }
 
       if (!res.ok) {
         let errData: any = {};
         try { errData = await res.json(); } catch {}
-        console.warn('TTS API returned error:', errData.error || res.statusText);
+        console.warn('[VOICE] TTS API returned error:', errData.error || res.statusText);
         setTtsUnavailable(true);
-        setVoiceError(errData.error || 'Audio output unavailable');
-        setVoiceState('IDLE');
+        setVoiceError(errData.error || `Audio output unavailable (status ${res.status})`);
+        
+        if (voiceSessionActiveRef.current) {
+          // If browser SpeechSynthesis is supported, speak the response aloud as seamless fallback
+          if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+            return new Promise<void>((resolve) => {
+              let resolved = false;
+              const cleanup = (shouldAutoRecord: boolean) => {
+                if (resolved) return;
+                resolved = true;
+                if (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
+                  setVoiceState('IDLE');
+                  resolve();
+                  return;
+                }
+                if (workflowCompleteRef.current) {
+                  endVoiceSession();
+                  resolve();
+                  return;
+                }
+                if (shouldAutoRecord) {
+                  console.log('[VOICE] restarting listener');
+                  startRecording();
+                } else {
+                  setVoiceState('IDLE');
+                }
+                resolve();
+              };
+
+              try {
+                const utterance = new SpeechSynthesisUtterance(textToSpeak);
+                const isHindi = /[\u0900-\u097F]/.test(textToSpeak);
+                utterance.lang = isHindi ? 'hi-IN' : 'en-US';
+                utterance.rate = 1.0;
+
+                utterance.onstart = () => {
+                  console.log('[VOICE] audio playback started');
+                };
+                utterance.onend = () => {
+                  console.log('[VOICE] audio playback ended');
+                  cleanup(true);
+                };
+                utterance.onerror = () => {
+                  cleanup(true);
+                };
+                window.speechSynthesis.speak(utterance);
+              } catch {
+                cleanup(true);
+              }
+            });
+          } else {
+            if (workflowCompleteRef.current) {
+              endVoiceSession();
+            } else {
+              console.log('[VOICE] restarting listener');
+              setTimeout(() => {
+                if (voiceSessionActiveRef.current && sessionId === recordingSessionIdRef.current && !workflowCompleteRef.current) {
+                  startRecording();
+                }
+              }, 1500);
+            }
+          }
+        } else {
+          setVoiceState('IDLE');
+        }
         return;
       }
 
       const audioBlob = await res.blob();
       if (!audioBlob || audioBlob.size === 0) {
-        console.warn('TTS API returned 0-byte audio blob.');
+        console.warn('[VOICE] TTS API returned 0-byte audio blob.');
         setTtsUnavailable(true);
+        if (voiceSessionActiveRef.current) {
+          if (workflowCompleteRef.current) {
+            endVoiceSession();
+          } else {
+            console.log('[VOICE] restarting listener');
+            setTimeout(() => {
+              if (voiceSessionActiveRef.current && sessionId === recordingSessionIdRef.current && !workflowCompleteRef.current) {
+                startRecording();
+              }
+            }, 1500);
+          }
+        } else {
+          setVoiceState('IDLE');
+        }
+        return;
+      }
+
+      // Check race condition before playing
+      if (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
         setVoiceState('IDLE');
         return;
       }
 
-      // TTS synthesis succeeded! Clear unavailable state & voice error
       setTtsUnavailable(false);
       setVoiceError(null);
 
@@ -346,67 +672,195 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
 
       return new Promise<void>((resolve) => {
         let resolved = false;
-        const cleanup = () => {
+
+        const cleanup = (shouldAutoRecord: boolean) => {
           if (resolved) return;
           resolved = true;
           URL.revokeObjectURL(audioUrl);
           if (activeAudioRef.current === audio) {
             activeAudioRef.current = null;
           }
-          setVoiceState('IDLE');
+
+          // Check if session was ended while audio was speaking
+          if (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
+            setVoiceState('IDLE');
+            resolve();
+            return;
+          }
+
+          // If workflow completed, end the session cleanly without recording
+          if (workflowCompleteRef.current) {
+            endVoiceSession();
+            resolve();
+            return;
+          }
+
+          if (shouldAutoRecord) {
+            console.log('[VOICE] restarting listener');
+            startRecording();
+          } else {
+            setVoiceState('IDLE');
+          }
           resolve();
         };
 
-        audio.onended = cleanup;
-        audio.onerror = (e) => {
-          console.warn('TTS audio playback error:', e);
-          setTtsUnavailable(true);
-          cleanup();
+        audio.onplay = () => {
+          console.log('[VOICE] audio playback started');
         };
 
-        audio.play().catch((playErr) => {
-          console.warn('TTS audio.play() rejected:', playErr);
+        audio.onended = () => {
+          console.log('[VOICE] audio playback ended');
+          cleanup(true);
+        };
+
+        audio.onerror = (e) => {
+          console.warn('[VOICE] TTS audio playback error:', e);
           setTtsUnavailable(true);
-          cleanup();
+          cleanup(true);
+        };
+
+        // Safety fallback timer for audio playback (e.g., 30s max)
+        const playbackTimeout = setTimeout(() => {
+          if (!resolved) {
+            console.warn('[VOICE] Audio playback timeout reached, recovering listener');
+            cleanup(true);
+          }
+        }, 30000);
+
+        audio.play().catch((playErr) => {
+          clearTimeout(playbackTimeout);
+          console.warn('[VOICE] TTS audio.play() rejected:', playErr);
+          setTtsUnavailable(true);
+          cleanup(true);
         });
       });
     } catch (err) {
-      console.warn('TTS Playback Exception:', err);
+      console.warn('[VOICE] TTS Playback Exception:', err);
       setTtsUnavailable(true);
-      setVoiceState('IDLE');
+      if (sessionId === recordingSessionIdRef.current && voiceSessionActiveRef.current) {
+        if (workflowCompleteRef.current) {
+          endVoiceSession();
+        } else {
+          console.log('[VOICE] restarting listener');
+          setTimeout(() => {
+            if (voiceSessionActiveRef.current && sessionId === recordingSessionIdRef.current && !workflowCompleteRef.current) {
+              startRecording();
+            }
+          }, 1500);
+        }
+      } else {
+        setVoiceState('IDLE');
+      }
     }
   }
 
-  // VOICE MODE: START MICROPHONE RECORDING
+  // VOICE MODE: STOP LISTENING TURN (Called automatically on silence detection or explicitly)
+  function stopListeningTurn() {
+    if (isListeningStoppingRef.current) return;
+    isListeningStoppingRef.current = true;
+    setIsUserSpeaking(false);
+
+    // Cancel VAD loop
+    if (vadRafIdRef.current) {
+      cancelAnimationFrame(vadRafIdRef.current);
+      vadRafIdRef.current = null;
+    }
+
+    console.log('[VOICE] stopping recorder');
+
+    // Stop MediaRecorder (triggers recorder.onstop)
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch (e) {
+        console.warn('[VOICE] Error stopping MediaRecorder in stopListeningTurn:', e);
+      }
+    } else {
+      // Fallback if recorder was already stopped or inactive
+      console.log('[VOICE] recorder was not recording');
+      if (voiceSessionActiveRef.current && !workflowCompleteRef.current) {
+        console.log('[VOICE] restarting listener');
+        setTimeout(() => {
+          if (voiceSessionActiveRef.current && !workflowCompleteRef.current) {
+            startRecording();
+          }
+        }, 200);
+      }
+      return;
+    }
+    setVoiceState('TRANSCRIBING');
+  }
+
+  // Alias for backward compatibility if invoked manually
+  function stopRecording() {
+    stopListeningTurn();
+  }
+
+  // VOICE MODE: START MICROPHONE LISTENING (HANDS-FREE VAD WITH AUTOMATIC SILENCE DETECTION)
   async function startRecording() {
+    if (!voiceSessionActiveRef.current) return;
+    if (workflowCompleteRef.current) {
+      endVoiceSession();
+      return;
+    }
+
+    // Prevent duplicate concurrent startRecording executions
+    if (isStartingRecordingRef.current) {
+      console.log('[VOICE] startRecording already in progress, skipping duplicate');
+      return;
+    }
+    isStartingRecordingRef.current = true;
+
     try {
       // 1. Increment session ID to invalidate any in-flight previous recording/STT callbacks
       const currentSessionId = ++recordingSessionIdRef.current;
+      isListeningStoppingRef.current = false;
+      speechStartedRef.current = false;
+      speechStartTimeRef.current = null;
+      silenceStartTimeRef.current = null;
+      setIsUserSpeaking(false);
 
-      // 2. Pause/cleanup active TTS audio if playing
+      // 2. Cancel any active VAD loop
+      if (vadRafIdRef.current) {
+        cancelAnimationFrame(vadRafIdRef.current);
+        vadRafIdRef.current = null;
+      }
+
+      // 3. Close any previous AudioContext
+      if (audioContextRef.current) {
+        try {
+          if (audioContextRef.current.state !== 'closed') {
+            audioContextRef.current.close();
+          }
+        } catch {}
+        audioContextRef.current = null;
+      }
+      analyserRef.current = null;
+
+      // 4. Pause/cleanup active TTS audio if playing
       if (activeAudioRef.current) {
         activeAudioRef.current.pause();
         activeAudioRef.current = null;
       }
 
-      // 3. Ensure any existing MediaRecorder is stopped & cleaned up
+      // 5. Ensure any existing MediaRecorder is stopped & cleaned up
       if (mediaRecorderRef.current) {
         try {
           if (mediaRecorderRef.current.state !== 'inactive') {
             mediaRecorderRef.current.stop();
           }
         } catch (e) {
-          console.warn('Error stopping previous MediaRecorder:', e);
+          console.warn('[VOICE] Error stopping previous MediaRecorder:', e);
         }
         mediaRecorderRef.current = null;
       }
 
-      // 4. Ensure any existing MediaStream tracks are stopped
+      // 6. Ensure any existing MediaStream tracks are stopped
       if (mediaStreamRef.current) {
         try {
           mediaStreamRef.current.getTracks().forEach((track) => track.stop());
         } catch (e) {
-          console.warn('Error stopping previous MediaStream:', e);
+          console.warn('[VOICE] Error stopping previous MediaStream:', e);
         }
         mediaStreamRef.current = null;
       }
@@ -418,7 +872,7 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
         throw new Error('Microphone recording is not supported in this browser.');
       }
 
-      // 5. Request a fresh audio stream with noise suppression & echo cancellation
+      // 7. Request a fresh audio stream with echo cancellation & noise suppression
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -426,9 +880,101 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
           autoGainControl: true,
         },
       });
+
+      // Verify session was not cancelled or invalidated during getUserMedia prompt
+      if (currentSessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
       mediaStreamRef.current = stream;
 
-      // 6. Select best supported MIME type
+      // 8. Initialize Web Audio API Analyser for Voice Activity & Silence Detection
+      const AudioCtxClass =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+
+      if (AudioCtxClass) {
+        try {
+          const audioCtx = new AudioCtxClass();
+          audioContextRef.current = audioCtx;
+          const analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 512;
+          analyser.smoothingTimeConstant = 0.2;
+          analyserRef.current = analyser;
+
+          const source = audioCtx.createMediaStreamSource(stream);
+          source.connect(analyser);
+
+          const timeDomainData = new Float32Array(analyser.fftSize);
+
+          // Real-time VAD Monitoring Loop
+          const vadLoop = () => {
+            if (
+              currentSessionId !== recordingSessionIdRef.current ||
+              !voiceSessionActiveRef.current ||
+              isListeningStoppingRef.current
+            ) {
+              return;
+            }
+
+            analyser.getFloatTimeDomainData(timeDomainData);
+            let sumSquares = 0;
+            for (let i = 0; i < timeDomainData.length; i++) {
+              sumSquares += timeDomainData[i] * timeDomainData[i];
+            }
+            const rms = Math.sqrt(sumSquares / timeDomainData.length);
+            const now = Date.now();
+
+            if (rms >= VAD_SPEECH_RMS_THRESHOLD) {
+              // Vocal speech detected
+              if (!speechStartedRef.current) {
+                speechStartedRef.current = true;
+                speechStartTimeRef.current = now;
+                setIsUserSpeaking(true);
+                console.log('[VOICE] VAD speech detected');
+              } else {
+                setIsUserSpeaking(true);
+              }
+              silenceStartTimeRef.current = null;
+            } else if (speechStartedRef.current) {
+              // User had started speaking, now in pause or silence
+              setIsUserSpeaking(false);
+              const speechDuration = now - (speechStartTimeRef.current || now);
+
+              if (speechDuration >= VAD_MIN_SPEECH_DURATION_MS) {
+                if (!silenceStartTimeRef.current) {
+                  silenceStartTimeRef.current = now;
+                } else if (now - silenceStartTimeRef.current >= VAD_SILENCE_DURATION_MS) {
+                  // Natural silence detected! Auto-complete user turn
+                  console.log('[VOICE] silence detected');
+                  stopListeningTurn();
+                  return;
+                }
+              }
+            }
+
+            // Safeguard: cap maximum single turn speech duration to 25s
+            if (
+              speechStartedRef.current &&
+              speechStartTimeRef.current &&
+              now - speechStartTimeRef.current >= VAD_MAX_TURN_DURATION_MS
+            ) {
+              console.log('[VOICE] silence detected');
+              stopListeningTurn();
+              return;
+            }
+
+            vadRafIdRef.current = requestAnimationFrame(vadLoop);
+          };
+
+          vadRafIdRef.current = requestAnimationFrame(vadLoop);
+        } catch (vadErr) {
+          console.warn('[VOICE] Web Audio API Analyser initialization notice:', vadErr);
+        }
+      }
+
+      // 9. Select best supported MIME type
       let selectedMimeType = 'audio/webm';
       if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported) {
         if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
@@ -447,7 +993,7 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
       const recorder = new MediaRecorder(stream, { mimeType: selectedMimeType });
       mediaRecorderRef.current = recorder;
 
-      // 7. Dedicated per-session chunks array bound to this specific recording session (0% risk of cross-turn leak)
+      // 10. Dedicated per-session chunks array bound to this specific recording session
       const sessionChunks: Blob[] = [];
 
       recorder.ondataavailable = (event: BlobEvent) => {
@@ -457,11 +1003,26 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
       };
 
       recorder.onstop = async () => {
-        // Stop stream tracks cleanly
+        console.log('[VOICE] recorder onstop fired');
+
+        // Disconnect & close AudioContext here AFTER recorder has stopped recording
+        if (audioContextRef.current) {
+          try {
+            if (audioContextRef.current.state !== 'closed') {
+              audioContextRef.current.close();
+            }
+          } catch (e) {
+            console.warn('[VOICE] Error closing AudioContext in onstop:', e);
+          }
+          audioContextRef.current = null;
+        }
+        analyserRef.current = null;
+
+        // Stop all microphone tracks immediately upon completion of turn
         try {
           stream.getTracks().forEach((track) => track.stop());
         } catch (e) {
-          console.warn('Error stopping stream tracks in onstop:', e);
+          console.warn('[VOICE] Error stopping stream tracks in onstop:', e);
         }
         if (mediaStreamRef.current === stream) {
           mediaStreamRef.current = null;
@@ -470,60 +1031,83 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
           mediaRecorderRef.current = null;
         }
 
-        // Check race condition: if session is stale, ignore
-        if (currentSessionId !== recordingSessionIdRef.current) {
-          console.warn(`[Voice Simulator] Discarding stopped recorder from stale session #${currentSessionId}`);
+        // Clean up VAD monitoring loop
+        if (vadRafIdRef.current) {
+          cancelAnimationFrame(vadRafIdRef.current);
+          vadRafIdRef.current = null;
+        }
+
+        // Check race condition: if session was ended or invalidated, discard audio
+        if (currentSessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
+          console.warn(`[VOICE] Discarding stopped recorder from inactive/stale session #${currentSessionId}`);
           return;
         }
 
         const actualMimeType = recorder.mimeType || selectedMimeType;
         const audioBlob = new Blob(sessionChunks, { type: actualMimeType });
+        console.log('[VOICE] audio blob created');
 
-        console.log(
-          `[Voice Simulator Session #${currentSessionId}] Recording finished: size=${audioBlob.size} bytes, type=${actualMimeType}, chunks=${sessionChunks.length}`
-        );
-
-        if (audioBlob.size < 500) {
-          console.warn(`[Voice Simulator Session #${currentSessionId}] Audio recording too small (${audioBlob.size} bytes).`);
-          setVoiceError('Audio recording was too short or empty. Please speak clearly into the microphone.');
-          setVoiceState('ERROR');
+        // If user didn't speak or segment is too small, silently re-open listener without breaking call
+        if (audioBlob.size < 500 || !speechStartedRef.current) {
+          console.log(`[VOICE] Ambient silence (size: ${audioBlob.size}b, speechDetected: ${speechStartedRef.current}). Re-opening listener.`);
+          if (voiceSessionActiveRef.current && !workflowCompleteRef.current) {
+            console.log('[VOICE] restarting listener');
+            setTimeout(() => {
+              if (voiceSessionActiveRef.current && currentSessionId === recordingSessionIdRef.current && !workflowCompleteRef.current) {
+                startRecording();
+              }
+            }, 200);
+          } else {
+            setVoiceState('IDLE');
+          }
           return;
         }
 
         await processVoiceRecording(audioBlob, actualMimeType, currentSessionId);
       };
 
-      // Start recording without timeslice so MediaRecorder produces a unified, header-intact WebM stream
       recorder.start();
       setVoiceState('RECORDING');
     } catch (err: unknown) {
-      console.error('Microphone Error:', err);
+      console.error('[VOICE] Microphone Error:', err);
       const msg =
         err instanceof Error
           ? err.message
           : 'Microphone permission denied or recording failed.';
-      setVoiceError(msg);
-      setVoiceState('ERROR');
-    }
-  }
 
-  // VOICE MODE: STOP MICROPHONE RECORDING
-  function stopRecording() {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      try {
-        mediaRecorderRef.current.stop();
-      } catch (e) {
-        console.warn('Error stopping MediaRecorder:', e);
+      const isFatal =
+        err instanceof DOMException &&
+        (err.name === 'NotAllowedError' ||
+          err.name === 'NotFoundError' ||
+          err.name === 'SecurityError');
+
+      if (isFatal) {
+        endVoiceSession();
+        setVoiceError(`Fatal microphone error: ${msg}`);
+        setVoiceState('ERROR');
+      } else {
+        setVoiceError(msg);
+        setVoiceState('ERROR');
+        // Non-fatal error: try re-opening if session is active
+        if (voiceSessionActiveRef.current && !workflowCompleteRef.current) {
+          setTimeout(() => {
+            if (voiceSessionActiveRef.current && !workflowCompleteRef.current) {
+              console.log('[VOICE] restarting listener');
+              startRecording();
+            }
+          }, 1500);
+        }
       }
-      setVoiceState('TRANSCRIBING');
+    } finally {
+      isStartingRecordingRef.current = false;
     }
   }
 
   // VOICE MODE: TRANSCRIBE & EXECUTE ENGINE
   async function processVoiceRecording(audioBlob: Blob, mimeType: string, sessionId: number) {
     try {
-      if (sessionId !== recordingSessionIdRef.current) {
-        console.warn(`[Voice Simulator] Discarding transcribe request for stale session #${sessionId}`);
+      if (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
+        console.warn(`[VOICE] Discarding transcribe request for inactive/stale session #${sessionId}`);
         return;
       }
 
@@ -531,7 +1115,8 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
 
       // Determine established conversation language from transcript history
       let establishedLang: string | undefined = undefined;
-      const userHistoryMsgs = transcript.filter((m) => m.role === 'user');
+      const history = transcriptRef.current.length > 0 ? transcriptRef.current : transcript;
+      const userHistoryMsgs = history.filter((m) => m.role === 'user');
       for (let i = userHistoryMsgs.length - 1; i >= 0; i--) {
         const text = userHistoryMsgs[i].content;
         if (/[\u0900-\u097F]/.test(text)) {
@@ -549,40 +1134,55 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
         ? `/api/voice/transcribe?lang=${encodeURIComponent(establishedLang)}`
         : '/api/voice/transcribe';
 
-      const res = await fetch(transcribeUrl, {
+      console.log('[VOICE] sending audio to STT');
+      console.log('[VOICE] STT request started');
+
+      const res = await fetchWithTimeout(transcribeUrl, {
         method: 'POST',
         headers: {
           'Content-Type': mimeType,
         },
         body: audioBlob,
-      });
+      }, 12000);
 
-      if (sessionId !== recordingSessionIdRef.current) {
-        console.warn(`[Voice Simulator] Discarding transcribe response for stale session #${sessionId}`);
+      console.log('[VOICE] STT response received');
+
+      if (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
+        console.warn(`[VOICE] Discarding transcribe response for inactive/stale session #${sessionId}`);
         return;
       }
 
       const data = await res.json();
       if (!res.ok) {
-        throw new Error(data.error || 'STT transcription failed.');
+        throw new Error(data.error || `STT transcription failed (status ${res.status})`);
       }
 
       const userText = data.transcript;
-      console.log(
-        `[Voice Simulator Session #${sessionId}] STT Result: "${userText}" (Language: ${data.language || 'en'}, Confidence: ${data.confidence ?? 'N/A'}, Retried: ${data.sttRetried || false})`
-      );
+      console.log('[VOICE] transcript received');
 
       if (!userText || !userText.trim()) {
-        throw new Error('Could not understand speech. Please try speaking again.');
+        throw new Error('Could not understand speech. Please speak again.');
       }
 
-      await processUserMessage(userText.trim());
+      await processUserMessage(userText.trim(), sessionId);
     } catch (err: unknown) {
-      if (sessionId !== recordingSessionIdRef.current) return;
-      console.error('Voice Processing Error:', err);
+      if (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) return;
+      console.error('[VOICE] STT Processing Error:', err);
       const msg = err instanceof Error ? err.message : 'Voice transcription failed';
-      setVoiceError(msg);
-      setVoiceState('ERROR');
+      setVoiceError(`${msg}. Resuming listening...`);
+
+      // Recoverable STT error: keep session active and re-listen
+      if (voiceSessionActiveRef.current && !workflowCompleteRef.current) {
+        setVoiceState('IDLE');
+        setTimeout(() => {
+          if (voiceSessionActiveRef.current && sessionId === recordingSessionIdRef.current && !workflowCompleteRef.current) {
+            console.log('[VOICE] restarting listener');
+            startRecording();
+          }
+        }, 1500);
+      } else {
+        setVoiceState('ERROR');
+      }
     }
   }
 
@@ -639,6 +1239,7 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
           <div className="bg-slate-100 p-1 rounded-lg flex items-center border border-slate-200">
             <button
               onClick={() => {
+                endVoiceSession();
                 setMode('text');
                 setTtsUnavailable(false);
                 setVoiceError(null);
@@ -669,9 +1270,20 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
             </button>
           </div>
 
+          {/* End Call Button if Voice session is currently active */}
+          {mode === 'voice' && voiceSessionActive && (
+            <button
+              onClick={endVoiceSession}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-bold rounded-lg shadow-xs transition-colors"
+            >
+              <PhoneOff className="w-3.5 h-3.5" />
+              <span>End Call</span>
+            </button>
+          )}
+
           {!conversationId ? (
             <button
-              onClick={startSimulation}
+              onClick={() => startSimulation(mode === 'voice')}
               disabled={initializing || !selectedWorkflowId}
               className="inline-flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white text-sm font-semibold rounded-lg shadow-xs transition-colors"
             >
@@ -689,7 +1301,7 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
             </button>
           ) : (
             <button
-              onClick={startSimulation}
+              onClick={() => startSimulation(mode === 'voice')}
               disabled={initializing}
               className="inline-flex items-center gap-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-lg transition-colors border border-slate-200"
             >
@@ -731,7 +1343,9 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
               <span className="text-xs font-bold text-slate-800">
                 {conversationId
                   ? mode === 'voice'
-                    ? 'Voice AI Call Simulation Active (Hindi / English)'
+                    ? voiceSessionActive
+                      ? 'Live Voice Call Connected (Hands-Free Hindi/English)'
+                      : 'Voice Call Session Idle'
                     : 'Text AI Call Simulation Active'
                   : 'Waiting to start...'}
               </span>
@@ -851,25 +1465,38 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
                 </button>
               </form>
             ) : (
-              /* VOICE MODE CONTROLS & STATE MACHINE */
+              /* VOICE MODE CONTROLS & HANDS-FREE PHONE CALL STATE MACHINE */
               <div className="space-y-3">
                 {/* Voice Status Indicator Banner */}
                 <div className="flex items-center justify-between px-3 py-2 bg-slate-50 rounded-lg border border-slate-200 text-xs">
                   <div className="flex items-center gap-2">
-                    {voiceState === 'RECORDING' && <Radio className="w-4 h-4 text-red-600 animate-pulse" />}
-                    {voiceState === 'TRANSCRIBING' && <Loader2 className="w-4 h-4 text-amber-600 animate-spin" />}
-                    {voiceState === 'THINKING' && <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />}
-                    {voiceState === 'SPEAKING' && <Volume2 className="w-4 h-4 text-indigo-600 animate-bounce" />}
-                    {voiceState === 'IDLE' && <Mic className="w-4 h-4 text-slate-500" />}
-                    {voiceState === 'ERROR' && <AlertCircle className="w-4 h-4 text-red-600" />}
+                    {voiceSessionActive && voiceState === 'RECORDING' && (
+                      isUserSpeaking ? (
+                        <Radio className="w-4 h-4 text-emerald-600 animate-pulse" />
+                      ) : (
+                        <Radio className="w-4 h-4 text-red-600 animate-pulse" />
+                      )
+                    )}
+                    {voiceSessionActive && voiceState === 'TRANSCRIBING' && <Loader2 className="w-4 h-4 text-amber-600 animate-spin" />}
+                    {voiceSessionActive && voiceState === 'THINKING' && <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />}
+                    {voiceSessionActive && voiceState === 'SPEAKING' && <Volume2 className="w-4 h-4 text-indigo-600 animate-bounce" />}
+                    {voiceSessionActive && voiceState === 'IDLE' && <PhoneCall className="w-4 h-4 text-emerald-600 animate-pulse" />}
+                    {(!voiceSessionActive || voiceState === 'ERROR') && (
+                      voiceState === 'ERROR' ? <AlertCircle className="w-4 h-4 text-red-600" /> : <Mic className="w-4 h-4 text-slate-500" />
+                    )}
 
                     <span className="font-semibold text-slate-800">
-                      {voiceState === 'IDLE' && 'Tap microphone to speak (English / Hindi)'}
-                      {voiceState === 'RECORDING' && 'Listening... Speak clearly into mic'}
-                      {voiceState === 'TRANSCRIBING' && 'Transcribing speech via Deepgram STT...'}
-                      {voiceState === 'THINKING' && 'AI engine checking workflow parameters...'}
-                      {voiceState === 'SPEAKING' && 'Playing audio response via ElevenLabs TTS...'}
-                      {voiceState === 'ERROR' && (voiceError || 'Voice error occurred')}
+                      {!voiceSessionActive && (voiceError || 'Call ended. Click Start Voice Call to begin.')}
+                      {voiceSessionActive && voiceState === 'RECORDING' && (
+                        isUserSpeaking
+                          ? 'Speaking detected... (listening)'
+                          : 'Listening... (speak naturally, pause to send)'
+                      )}
+                      {voiceSessionActive && voiceState === 'TRANSCRIBING' && 'Processing speech...'}
+                      {voiceSessionActive && voiceState === 'THINKING' && 'Processing response...'}
+                      {voiceSessionActive && voiceState === 'SPEAKING' && 'Assistant speaking... (microphone paused)'}
+                      {voiceSessionActive && voiceState === 'IDLE' && 'Call connected... preparing next turn'}
+                      {voiceSessionActive && voiceState === 'ERROR' && (voiceError || 'Voice issue detected. Resuming call...')}
                     </span>
                   </div>
 
@@ -880,34 +1507,76 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
                   )}
                 </div>
 
-                {/* Microphone Button Controls */}
+                {/* Hands-Free Voice Call Controls */}
                 <div className="flex items-center justify-center gap-4">
-                  {voiceState === 'IDLE' || voiceState === 'ERROR' ? (
+                  {!voiceSessionActive ? (
                     <button
-                      onClick={startRecording}
-                      disabled={!conversationId || workflowComplete}
-                      aria-label="Start speaking"
-                      className="w-16 h-16 rounded-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white flex items-center justify-center shadow-lg transition-transform active:scale-95 focus:outline-none focus:ring-4 focus:ring-indigo-300"
+                      onClick={startVoiceCall}
+                      disabled={initializing || workflowComplete}
+                      aria-label="Start voice call"
+                      className="flex items-center gap-3 px-6 py-3.5 rounded-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white font-bold text-xs shadow-lg transition-transform active:scale-95 focus:outline-none focus:ring-4 focus:ring-indigo-300"
                     >
-                      <Mic className="w-7 h-7" />
-                    </button>
-                  ) : voiceState === 'RECORDING' ? (
-                    <button
-                      onClick={stopRecording}
-                      aria-label="Stop recording"
-                      className="w-16 h-16 rounded-full bg-red-600 hover:bg-red-700 text-white flex items-center justify-center shadow-lg animate-pulse focus:outline-none focus:ring-4 focus:ring-red-300"
-                    >
-                      <MicOff className="w-7 h-7" />
+                      <Mic className="w-5 h-5" />
+                      <span>Start Voice Call</span>
                     </button>
                   ) : (
-                    <div className="w-16 h-16 rounded-full bg-slate-100 text-slate-400 flex items-center justify-center border border-slate-200">
-                      <Loader2 className="w-7 h-7 animate-spin text-indigo-600" />
-                    </div>
+                    <>
+                      {/* Hands-Free Real-Time State Badge */}
+                      {voiceState === 'RECORDING' ? (
+                        <div className="flex items-center gap-2.5 px-5 py-3 rounded-full bg-white border border-slate-200 shadow-sm text-xs">
+                          {isUserSpeaking ? (
+                            <>
+                              <span className="relative flex h-3 w-3">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                                <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+                              </span>
+                              <span className="font-extrabold text-emerald-700">Speaking...</span>
+                            </>
+                          ) : (
+                            <>
+                              <span className="relative flex h-3 w-3">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                                <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500"></span>
+                              </span>
+                              <span className="font-bold text-slate-800">Listening...</span>
+                            </>
+                          )}
+                        </div>
+                      ) : voiceState === 'SPEAKING' ? (
+                        <div className="flex items-center gap-2.5 px-5 py-3 rounded-full bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs font-bold shadow-xs">
+                          <Volume2 className="w-4 h-4 animate-bounce text-indigo-600" />
+                          <span>Assistant Speaking...</span>
+                        </div>
+                      ) : voiceState === 'TRANSCRIBING' || voiceState === 'THINKING' ? (
+                        <div className="flex items-center gap-2.5 px-5 py-3 rounded-full bg-slate-100 border border-slate-200 text-slate-700 text-xs font-semibold shadow-xs">
+                          <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
+                          <span>Processing...</span>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-2.5 px-5 py-3 rounded-full bg-slate-100 border border-slate-200 text-slate-500 text-xs font-semibold shadow-xs">
+                          <Loader2 className="w-4 h-4 animate-spin text-slate-400" />
+                          <span>Connecting turn...</span>
+                        </div>
+                      )}
+
+                      {/* Primary Call Control: End Call */}
+                      <button
+                        onClick={endVoiceSession}
+                        aria-label="End call"
+                        title="End Call"
+                        className="flex items-center gap-2 px-5 py-3 rounded-full bg-red-600 hover:bg-red-700 text-white text-xs font-bold transition-all shadow-md active:scale-95 focus:outline-none focus:ring-4 focus:ring-red-300"
+                      >
+                        <PhoneOff className="w-4 h-4" />
+                        <span>End Call</span>
+                      </button>
+                    </>
                   )}
                 </div>
 
                 <div className="text-center text-[10px] text-slate-400 font-medium">
-                  {voiceState === 'RECORDING' ? 'Click red button when done speaking' : 'Supports English & Hindi/Hinglish callbacks'}
+                  {voiceSessionActive
+                    ? 'Hands-free call active. Speak naturally; the assistant detects pauses and responds automatically.'
+                    : 'Hands-free automated phone call. Supports English & Hindi/Hinglish.'}
                 </div>
               </div>
             )}
