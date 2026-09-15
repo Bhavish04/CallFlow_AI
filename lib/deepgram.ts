@@ -117,23 +117,35 @@ export async function transcribeAudioWithDeepgram(
     // Controlled 1-retry mechanism if initial transcript is suspicious and language wasn't strictly forced
     const isSuspicious = isSuspiciousSTT(initialTranscript, initialConfidence, initialLanguage);
     if (isSuspicious && (!requestedLang || requestedLang === 'auto' || requestedLang === 'hinglish')) {
+      // Intelligently select retry language:
+      // If user specifically requested Hindi, or transcript contains Devanagari script, retry with 'hi'.
+      // Otherwise (English / Hinglish / Latin script), retry with 'en' to preserve Latin script and proper names without converting to Devanagari.
+      const retryLang =
+        requestedLang === 'hi'
+          ? 'hi'
+          : requestedLang === 'en' || requestedLang === 'hinglish'
+          ? 'en'
+          : /[\u0900-\u097F]/.test(initialTranscript) || initialLanguage === 'hi'
+          ? 'hi'
+          : 'en';
+
       console.warn(
-        `[Deepgram STT] Primary transcript suspicious ("${initialTranscript || 'empty'}"). Performing 1 controlled retry with language=hi...`
+        `[Deepgram STT] Primary transcript suspicious ("${initialTranscript || 'empty'}", lang=${initialLanguage}). Performing 1 controlled retry with language=${retryLang}...`
       );
       try {
-        const retryData = await callDeepgramAPI(input.audioBuffer, input.mimeType, apiKey, 'hi');
+        const retryData = await callDeepgramAPI(input.audioBuffer, input.mimeType, apiKey, retryLang);
         const retryAlt = retryData?.results?.channels?.[0]?.alternatives?.[0];
         const retryTranscript = (retryAlt?.transcript || '').trim();
         const retryConf = typeof retryAlt?.confidence === 'number' ? retryAlt.confidence : 1.0;
-        const retryLang = retryAlt?.languages?.[0] || 'hi';
+        const resultLang = retryAlt?.languages?.[0] || retryLang;
 
-        if (!isSuspiciousSTT(retryTranscript, retryConf, retryLang)) {
+        if (!isSuspiciousSTT(retryTranscript, retryConf, resultLang)) {
           finalTranscript = retryTranscript;
           finalConfidence = retryConf;
-          finalLanguage = retryLang;
+          finalLanguage = resultLang;
           sttRetried = true;
           console.log(
-            `[Deepgram STT] Controlled retry succeeded: transcript="${finalTranscript}", confidence=${finalConfidence}`
+            `[Deepgram STT] Controlled retry succeeded: transcript="${finalTranscript}", confidence=${finalConfidence}, language=${finalLanguage}`
           );
         }
       } catch (retryErr) {

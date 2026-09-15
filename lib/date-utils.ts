@@ -26,9 +26,40 @@ export function getBusinessToday(timeZone: string = 'America/New_York'): Date {
   }
 }
 
+export function isMonthOnly(input: string): boolean {
+  if (!input || typeof input !== 'string') return false;
+  const cleaned = input.trim().toLowerCase().replace(/[.,!?-]/g, '');
+  if (!cleaned) return false;
+
+  // If it has any digits, it's not month-only (e.g. "September 4")
+  if (/\d/.test(cleaned)) return false;
+
+  // If it contains relative date keywords, it's not month-only (e.g. "today", "tomorrow", "kal", "next monday")
+  if (/today|tomorrow|kal|aaj|parso|कल|आज|परसों|next|monday|tuesday|wednesday|thursday|friday|saturday|sunday/i.test(cleaned)) {
+    return false;
+  }
+
+  const monthNames = [
+    'january', 'february', 'march', 'april', 'may', 'june',
+    'july', 'august', 'september', 'october', 'november', 'december',
+    'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'sept', 'oct', 'nov', 'dec',
+    'जनवरी', 'फरवरी', 'मार्च', 'अप्रैल', 'मई', 'जून',
+    'जुलाई', 'अगस्त', 'सितंबर', 'सितम्बर', 'अक्टूबर', 'नवंबर', 'दिसंबर'
+  ];
+
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  // Match standalone month or phrase like "in September", "September month"
+  return words.length <= 3 && words.some((w) => monthNames.includes(w));
+}
+
 export function resolveDateString(dateInput: string, referenceDate: Date = new Date()): string {
   if (!dateInput) return '';
   const trimmed = dateInput.trim();
+
+  // A month name alone must NOT satisfy a date field
+  if (isMonthOnly(trimmed)) {
+    return '';
+  }
 
   // If already YYYY-MM-DD format
   if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
@@ -65,7 +96,11 @@ export function resolveDateString(dateInput: string, referenceDate: Date = new D
     return formatDateYYYYMMDD(base);
   }
 
-  // Handle "September 4", "4 September", "4th September" or Hindi Devanagari "4 सितंबर", "सितंबर 4"
+  // Handle weekday expressions: "next Monday", "this Friday", "Monday", "Tuesday", etc.
+  const weekdays = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  const weekdayMatch = lower.match(/(?:next|this)?\s*(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i);
+
+  // Handle "September 4", "4 September", "September 4th", "4th September" or Hindi Devanagari "4 सितंबर", "सितंबर 4"
   const monthNames = [
     'january', 'february', 'march', 'april', 'may', 'june',
     'july', 'august', 'september', 'october', 'november', 'december'
@@ -111,14 +146,28 @@ export function resolveDateString(dateInput: string, referenceDate: Date = new D
     }
   }
 
-  // Try standard date parsing for strings like "09/04/2026"
+  // Weekday expressions e.g. "next monday", "monday", "this friday"
+  if (weekdayMatch) {
+    const targetDayIndex = weekdays.indexOf(weekdayMatch[1].toLowerCase());
+    const currentDayIndex = base.getDay();
+    let diffDays = targetDayIndex - currentDayIndex;
+    if (diffDays <= 0 || lower.includes('next')) {
+      diffDays += 7;
+    }
+    base.setDate(base.getDate() + diffDays);
+    return formatDateYYYYMMDD(base);
+  }
+
+  // Try standard date parsing for strings like "09/04/2026" or "2026/09/04"
   const parsedTimestamp = Date.parse(dateInput);
   if (!isNaN(parsedTimestamp)) {
     const d = new Date(parsedTimestamp);
-    return formatDateYYYYMMDD(d);
+    if (!isNaN(d.getTime()) && /\d/.test(dateInput)) {
+      return formatDateYYYYMMDD(d);
+    }
   }
 
-  return dateInput;
+  return '';
 }
 
 export function formatNaturalTime12h(timeStr: string): string {
@@ -323,6 +372,7 @@ export function extractTimeFromMessage(userMessage: string): string | null {
 
 export function extractDateFromMessage(userMessage: string, referenceDate: Date = new Date()): string | null {
   if (!userMessage || typeof userMessage !== 'string') return null;
+  if (isMonthOnly(userMessage)) return null;
   const lower = userMessage.trim().toLowerCase();
 
   if (lower.includes('today') || lower.includes('aaj') || lower.includes('आज')) {
@@ -335,12 +385,36 @@ export function extractDateFromMessage(userMessage: string, referenceDate: Date 
     return resolveDateString('day after tomorrow', referenceDate);
   }
 
+  // Weekday expressions e.g. "next monday", "monday", "this friday"
+  const weekdayRegex = /\b(?:next|this)?\s*(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i;
+  const weekdayMatch = lower.match(weekdayRegex);
+  if (weekdayMatch) {
+    const resolvedWeekday = resolveDateString(weekdayMatch[0], referenceDate);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(resolvedWeekday)) {
+      return resolvedWeekday;
+    }
+  }
+
   const dateRegex = /\b(\d{4}-\d{2}-\d{2})\b|\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?\b|\b(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b/i;
   const match = lower.match(dateRegex);
   if (match) {
     const resolved = resolveDateString(match[0], referenceDate);
     if (/^\d{4}-\d{2}-\d{2}$/.test(resolved)) {
       return resolved;
+    }
+  }
+
+  // Devanagari Hindi dates e.g. "4 सितंबर", "सितंबर 4"
+  const hindiMonthNames = [
+    'जनवरी', 'फरवरी', 'मार्च', 'अप्रैल', 'मई', 'जून',
+    'जुलाई', 'अगस्त', 'सितंबर', 'सितम्बर', 'अक्टूबर', 'नवंबर', 'दिसंबर'
+  ];
+  for (const hMonth of hindiMonthNames) {
+    if (lower.includes(hMonth)) {
+      const resolved = resolveDateString(userMessage, referenceDate);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(resolved)) {
+        return resolved;
+      }
     }
   }
 

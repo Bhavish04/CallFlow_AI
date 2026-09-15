@@ -8,6 +8,7 @@ import {
   cancelCalendarEvent,
 } from '@/lib/google-calendar';
 import {
+  isMonthOnly,
   resolveDateString,
   normalizeTimeString,
   extractTimeFromMessage,
@@ -106,7 +107,7 @@ REMAINING MISSING REQUIRED FIELDS: ${missingListStr}
 CRITICAL INSTRUCTIONS:
 1. MATCH CUSTOMER LANGUAGE EXACTLY AS INSTRUCTED ABOVE.
 2. ONE QUESTION AT A TIME: Ask for ONLY the FIRST missing required field (${missingListStr.split(',')[0]}). DO NOT SKIP AHEAD TO OTHER FIELDS.
-3. DATES & TIMES: Convert relative date words to YYYY-MM-DD based on Reference Today Date ${referenceDateStr}. Normalize times to HH:mm.
+3. DATES & TIMES: Convert relative date words to YYYY-MM-DD based on Reference Today Date ${referenceDateStr}. Normalize times to HH:mm. A month name alone (such as 'September' or 'अगस्त') is NOT a valid appointment date. NEVER invent or guess a day if the user only provides a month. If the user only says a month, do NOT extract date, leave date null, and ask: "Could you please tell me the specific date? For example, September 4th."
 4. EXTRACT DATA: Extract key-value pairs accurately in JSON. ONLY extract fields that the user explicitly answered. NEVER assume, guess, or invent a default time (such as 4 PM or 12 PM) if the user only provided a date. If 'time' is in REMAINING MISSING REQUIRED FIELDS and the user did not give an explicit time, leave 'time' missing/null.
 5. CALENDAR WORKFLOW RULE: If all required fields are collected, DO NOT generate a booking confirmation message (such as "Your appointment is booked"). The system backend handles calendar availability checks and confirmation prompts authoritatively. If missing fields remain, reply asking for ONLY the FIRST missing field.
 
@@ -244,9 +245,9 @@ function getLanguageConsistentQuestion(
   }
 
   if (fName.includes('date')) {
-    if (userLangStyle === 'hindi') return `${nameHiPrefix}कृपया अपनी अपॉइंटमेंट की तारीख बताइए।`;
-    if (userLangStyle === 'hinglish') return `${nameEnPrefix}Aap appointment ki date bata dijiye.`;
-    return `${nameEnPrefix}Could you please provide your appointment date?`;
+    if (userLangStyle === 'hindi') return `${nameHiPrefix}कृपया निश्चित तारीख बताइए, जैसे आज, कल या 4 सितंबर।`;
+    if (userLangStyle === 'hinglish') return `${nameEnPrefix}Could you please tell me the specific date? For example, September 4th.`;
+    return `${nameEnPrefix}Could you please tell me the specific date? For example, September 4th.`;
   }
 
   if (fName.includes('time')) {
@@ -315,12 +316,9 @@ function isPlausibleFieldValue(fieldName: string, text: string): boolean {
   }
 
   if (fieldName.includes('date')) {
-    return (
-      /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ||
-      lower.includes('aaj') || lower.includes('kal') || lower.includes('parso') ||
-      lower.includes('today') || lower.includes('tomorrow') || lower.includes('आज') || lower.includes('कल') || lower.includes('परसों') ||
-      /september|october|november|december|january|february|march|april|may|june|july|august/i.test(trimmed)
-    );
+    if (isMonthOnly(trimmed)) return false;
+    const resolved = resolveDateString(trimmed, new Date());
+    return /^\d{4}-\d{2}-\d{2}$/.test(resolved);
   }
 
   if (fieldName.includes('time')) {
@@ -362,17 +360,22 @@ function isFieldAnsweredInUserMessage(
     );
   }
 
-  // STRICT RULE FOR DATE: Date value MUST be backed by date evidence in user message.
+  // STRICT RULE FOR DATE: Date value MUST be backed by date evidence in user message. Month alone is invalid.
   if (fName.includes('date')) {
+    if (isMonthOnly(userMessage) || isMonthOnly(String(fieldValue))) {
+      return false;
+    }
     const extracted = extractDateFromMessage(userMessage, new Date());
-    if (extracted) return true;
+    if (extracted && /^\d{4}-\d{2}-\d{2}$/.test(extracted)) return true;
+    const resolvedFieldVal = resolveDateString(String(fieldValue), new Date());
     return (
-      /^\d{4}-\d{2}-\d{2}$/.test(String(fieldValue)) &&
+      /^\d{4}-\d{2}-\d{2}$/.test(resolvedFieldVal) &&
+      !isMonthOnly(userMessage) &&
       (
         lowerMsg.includes('aaj') || lowerMsg.includes('kal') || lowerMsg.includes('parso') ||
         lowerMsg.includes('today') || lowerMsg.includes('tomorrow') || lowerMsg.includes('आज') || lowerMsg.includes('कल') || lowerMsg.includes('परसों') ||
         /\d/.test(lowerMsg) ||
-        /january|february|march|april|may|june|july|august|september|october|november|december|जनवरी|फरवरी|मार्च|अप्रैल|मई|जून|जुलाई|अगस्त|सितंबर|सितम्बर|अक्टूबर|नवंबर|दिसंबर/i.test(lowerMsg)
+        /(?:next|this)?\s*(?:sunday|monday|tuesday|wednesday|thursday|friday|saturday)/i.test(lowerMsg)
       )
     );
   }
@@ -582,10 +585,16 @@ export async function processConversationTurn(
       userMessage.trim().length < 50 &&
       !userMessage.toLowerCase().includes('appointment') &&
       !userMessage.toLowerCase().includes('book') &&
-      !userMessage.toLowerCase().includes('cake') &&
       isPlausibleFieldValue(targetField.name, userMessage.trim())
     ) {
-      mergedCollectedData[targetField.name] = userMessage.trim();
+      if (targetField.name.toLowerCase().includes('date')) {
+        const resDate = resolveDateString(userMessage.trim(), referenceDate);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(resDate)) {
+          mergedCollectedData[targetField.name] = resDate;
+        }
+      } else {
+        mergedCollectedData[targetField.name] = userMessage.trim();
+      }
     }
   }
 
@@ -595,12 +604,17 @@ export async function processConversationTurn(
     mergedCollectedData.time = explicitTime;
   }
   const explicitDate = extractDateFromMessage(userMessage, referenceDate);
-  if (explicitDate) {
+  if (explicitDate && /^\d{4}-\d{2}-\d{2}$/.test(explicitDate)) {
     mergedCollectedData.date = explicitDate;
   }
 
   if (mergedCollectedData.date) {
-    mergedCollectedData.date = resolveDateString(mergedCollectedData.date as string, referenceDate);
+    const resolvedDate = resolveDateString(mergedCollectedData.date as string, referenceDate);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(resolvedDate)) {
+      mergedCollectedData.date = resolvedDate;
+    } else {
+      delete mergedCollectedData.date;
+    }
   }
 
   if (mergedCollectedData.delivery_preference) {
@@ -886,12 +900,10 @@ export async function processConversationTurn(
           finalReply = 'Could you please repeat your preferred time? For example, 2 PM or 4 PM.';
         }
       } else if (fieldName === 'date' && !mergedCollectedData.date) {
-        if (userLangStyle === 'hinglish') {
-          finalReply = 'Date ek baar phir bata dijiye, jaise aaj, kal ya 4 September.';
-        } else if (userLangStyle === 'hindi') {
-          finalReply = 'कृपया तारीख एक बार फिर बताइए। जैसे आज, कल या 4 सितंबर।';
+        if (userLangStyle === 'hindi') {
+          finalReply = 'कृपया निश्चित तारीख बताइए, जैसे 4 सितंबर।';
         } else {
-          finalReply = 'Could you please repeat the date? For example, today, tomorrow, or September 4.';
+          finalReply = 'Could you please tell me the specific date? For example, September 4th.';
         }
       } else {
         // Force the reply to ask for the FIRST missing field in workflow order
@@ -986,7 +998,7 @@ export async function processConversationTurn(
       (workflow.closing && finalReply.toLowerCase().trim() === workflow.closing.toLowerCase().trim()) ||
       /booked|confirmed|scheduled|added to google calendar|successfully booked|ho gaya|हो गया|बुक कर ली गई|कन्फर्म हो गई|कन्फर्म कर दी गई|कन्फर्म हो चुकी|google calendar में add/i.test(finalReply);
 
-    if (isGenericClosingOrBookingClaim || calendarStatus === 'UNAVAILABLE' || calendarStatus === 'AVAILABLE' || calendarStatus === 'AWAITING_CONFIRMATION' || calendarStatus === 'ERROR') {
+    if (isGenericClosingOrBookingClaim || calendarStatus === 'CHECKING' || calendarStatus === 'UNAVAILABLE' || calendarStatus === 'AVAILABLE' || calendarStatus === 'AWAITING_CONFIRMATION' || calendarStatus === 'ERROR') {
       console.log(`[Calendar State Guard] OVERRIDING invalid response containing premature booking/closing claim during calendarStatus="${calendarStatus}": "${finalReply}"`);
 
       if (calendarStatus === 'UNAVAILABLE') {
@@ -1013,6 +1025,18 @@ export async function processConversationTurn(
         } else {
           finalReply = `I am sorry, there was a system issue creating your appointment (${calendarError || 'system error'}). Would you like to try again?`;
         }
+      } else if (calendarStatus === 'CHECKING') {
+        if (!evalState.isComplete) {
+          finalReply = getLanguageConsistentQuestion(evalState.missingRequiredFields[0], userLangStyle, customerName);
+        } else {
+          if (userLangStyle === 'hinglish') {
+            finalReply = `${naturalDateStr} ko ${naturalTimeStr} ka slot available hai. Kya main aapki booking confirm kar doon?`;
+          } else if (userLangStyle === 'hindi') {
+            finalReply = `${naturalDateStr} को ${naturalTimeStr} का स्लॉट उपलब्ध है। क्या मैं आपकी बुकिंग कन्फर्म कर दूँ?`;
+          } else {
+            finalReply = `The slot for ${naturalDateStr} at ${naturalTimeStr} is available. Would you like me to confirm the appointment?`;
+          }
+        }
       } else if (!evalState.isComplete) {
         finalReply = getLanguageConsistentQuestion(evalState.missingRequiredFields[0], userLangStyle, customerName);
       }
@@ -1027,7 +1051,7 @@ export async function processConversationTurn(
   const finalEventId = calendarEventId || input.calendarEventId || null;
 
   const isWorkflowFullyDone = isCalendarActionConfigured
-    ? (calendarStatus === 'EVENT_CREATED' && Boolean(finalEventId))
+    ? ((calendarStatus === 'EVENT_CREATED' && Boolean(finalEventId)) || calendarStatus === 'CANCELLED')
     : (evalState.isComplete && evalState.missingRequiredFields.length === 0);
 
   let bookingTicket: BookingTicket | null = null;

@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server';
+import { NextResponse, after } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { processConversationTurn } from '@/lib/ai-agent';
 import { evaluateWorkflowState } from '@/lib/workflow-engine';
@@ -15,29 +15,19 @@ export async function POST(request: Request) {
 
     const supabase = await createClient();
 
-    // 1. Load selected workflow
-    const { data: workflowData, error: wfError } = await supabase
-      .from('workflows')
-      .select('*')
-      .eq('id', workflowId)
-      .single();
+    // 1. Parallel joined query: fetch workflow (with joined business) and conversation concurrently
+    const [wfResult, convResult]: [any, any] = await Promise.all([
+      supabase.from('workflows').select('*, businesses(*)').eq('id', workflowId).single(),
+      conversationId
+        ? supabase.from('conversations').select('*').eq('id', conversationId).single()
+        : Promise.resolve({ data: null, error: null }),
+    ]);
 
-    if (wfError || !workflowData) {
+    if (wfResult.error || !wfResult.data) {
       return NextResponse.json({ error: 'Workflow not found' }, { status: 404 });
     }
-    const workflow = workflowData as Workflow;
-
-    // 2. Load business profile
-    const { data: bizData, error: bizError } = await supabase
-      .from('businesses')
-      .select('*')
-      .eq('id', workflow.business_id)
-      .single();
-
-    if (bizError || !bizData) {
-      return NextResponse.json({ error: 'Associated business profile not found' }, { status: 404 });
-    }
-    const business = bizData as Business;
+    const workflow = wfResult.data as Workflow;
+    const business = (wfResult.data.businesses || {}) as Business;
 
     // SCENARIO A: INITIALIZE NEW SIMULATION CONVERSATION
     if (!conversationId || !message || !message.trim()) {
@@ -103,11 +93,8 @@ export async function POST(request: Request) {
     }
 
     // SCENARIO B: CONTINUE EXISTING CONVERSATION
-    const { data: convData, error: convError } = await supabase
-      .from('conversations')
-      .select('*')
-      .eq('id', conversationId)
-      .single();
+    const convData = convResult?.data;
+    const convError = convResult?.error;
 
     if (convError || !convData) {
       return NextResponse.json({ error: 'Conversation not found' }, { status: 404 });
@@ -233,15 +220,21 @@ export async function POST(request: Request) {
       updatePayload.calendar_event_id = targetCalId;
     }
 
-    const { error: updateError } = await supabase
-      .from('conversations')
-      // @ts-ignore Supabase update payload
-      .update(updatePayload as any)
-      .eq('id', conversationId);
+    after(async () => {
+      try {
+        const { error: updateError } = await supabase
+          .from('conversations')
+          // @ts-ignore Supabase update payload
+          .update(updatePayload as any)
+          .eq('id', conversationId);
 
-    if (updateError) {
-      console.error('Error updating conversation row:', updateError);
-    }
+        if (updateError) {
+          console.error('Error updating conversation row in background:', updateError);
+        }
+      } catch (dbErr) {
+        console.error('Exception updating conversation row in background:', dbErr);
+      }
+    });
 
     return NextResponse.json({
       conversationId: conversation.id,

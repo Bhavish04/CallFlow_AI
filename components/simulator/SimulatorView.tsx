@@ -133,11 +133,46 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
   const isListeningStoppingRef = useRef<boolean>(false);
   const [isUserSpeaking, setIsUserSpeaking] = useState<boolean>(false);
 
-  // Calibrated VAD parameters for natural phone-call turn-taking
+  // Calibrated VAD parameters for natural phone-call turn-taking & barge-in
   const VAD_SPEECH_RMS_THRESHOLD = 0.024; // Threshold indicating speech above room noise
-  const VAD_SILENCE_DURATION_MS = 1400; // 1.4s natural pause before concluding turn
+  const VAD_BARGE_IN_RMS_THRESHOLD = 0.034; // Calibrated barge-in threshold (above AEC echo bleed ~0.015, reliable for natural human voice)
+  const VAD_SILENCE_DURATION_MS = 750; // 750ms natural pause before concluding turn (optimized from 1400ms)
   const VAD_MIN_SPEECH_DURATION_MS = 350; // Minimum speech duration to prevent click/cough misfires
+  const VAD_BARGE_IN_MIN_DURATION_MS = 350; // Minimum sustained vocal energy to confirm barge-in
+  const VAD_BARGE_IN_DIP_TOLERANCE_MS = 140; // Tolerance for brief unvoiced stop consonants (p, t, k)
   const VAD_MAX_TURN_DURATION_MS = 25000; // Safeguard: max 25s per single turn
+
+  // Barge-in & Interruption State Refs
+  const isAssistantSpeakingRef = useRef<boolean>(false);
+  const ttsInterruptedRef = useRef<boolean>(false);
+  const bargeInStartTimeRef = useRef<number | null>(null);
+  const bargeInLastHighTimeRef = useRef<number | null>(null);
+  const tentativeRecorderRef = useRef<MediaRecorder | null>(null);
+  const tentativeChunksRef = useRef<Blob[]>([]);
+  const mediaStreamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const activeTtsResolveRef = useRef<(() => void) | null>(null);
+  const vadLoopIdRef = useRef<number>(0);
+  const lastBargeInCancelTimeRef = useRef<number>(0);
+  const isStartingTentativeRef = useRef<boolean>(false);
+  const hasValidSpeechRef = useRef<boolean>(false);
+
+  // Performance Instrumentation Tracking Ref
+  interface VoiceTurnPerf {
+    tSpeechEnd?: number;
+    tRecorderStop?: number;
+    tAudioBlob?: number;
+    tSttStart?: number;
+    tSttResponse?: number;
+    tTranscript?: number;
+    tAiStart?: number;
+    tAiResponse?: number;
+    tTtsStart?: number;
+    tTtsResponse?: number;
+    tPlaybackStart?: number;
+    tPlaybackEnd?: number;
+    tListenerRestart?: number;
+  }
+  const turnPerfRef = useRef<VoiceTurnPerf>({});
 
   useEffect(() => {
     conversationIdRef.current = conversationId;
@@ -179,14 +214,45 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
     silenceStartTimeRef.current = null;
     isListeningStoppingRef.current = false;
     isStartingRecordingRef.current = false;
+    isAssistantSpeakingRef.current = false;
+    ttsInterruptedRef.current = false;
+    bargeInStartTimeRef.current = null;
+    bargeInLastHighTimeRef.current = null;
+
+    // Immediately unblock any waiting TTS promise
+    if (activeTtsResolveRef.current) {
+      try { activeTtsResolveRef.current(); } catch (e) {}
+      activeTtsResolveRef.current = null;
+    }
 
     // Invalidate any in-flight asynchronous operations, STT, or TTS callbacks
     recordingSessionIdRef.current++;
 
     // Cancel VAD animation frame loop
+    vadLoopIdRef.current++;
     if (vadRafIdRef.current) {
       cancelAnimationFrame(vadRafIdRef.current);
       vadRafIdRef.current = null;
+    }
+
+    // Cancel and clean up tentative barge-in recorder if active
+    if (tentativeRecorderRef.current) {
+      try {
+        tentativeRecorderRef.current.onstop = null;
+        if (tentativeRecorderRef.current.state !== 'inactive') {
+          tentativeRecorderRef.current.stop();
+        }
+      } catch (e) {}
+      tentativeRecorderRef.current = null;
+    }
+    tentativeChunksRef.current = [];
+
+    // Disconnect media stream source node
+    if (mediaStreamSourceRef.current) {
+      try {
+        mediaStreamSourceRef.current.disconnect();
+      } catch (e) {}
+      mediaStreamSourceRef.current = null;
     }
 
     // Disconnect & close AudioContext
@@ -373,82 +439,40 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
     setVoiceError(null);
     setTtsUnavailable(false);
 
-    // POST-COMPLETION SAFEGUARD: Stop further AI / Groq / Calendar processing after workflow complete
+    // POST-COMPLETION SAFEGUARD: Once workflow reaches completed state, ignore further user turns cleanly
     if (workflowCompleteRef.current) {
+      console.log('[WORKFLOW] Workflow already completed. Ignoring further user input.');
+      if (voiceSessionActiveRef.current) {
+        endVoiceSession();
+      }
+      return;
+    }
+
+    const lastMsg = transcriptRef.current[transcriptRef.current.length - 1];
+    const isAlreadyAdded = lastMsg && lastMsg.role === 'user' && lastMsg.content === userText.trim();
+    if (!isAlreadyAdded) {
       const tempUserMsg: TranscriptMessage = {
         role: 'user',
         content: userText.trim(),
         timestamp: new Date().toISOString(),
       };
-
-      let isHindi = /[\u0900-\u097F]/.test(userText);
-      let isHinglish = false;
-      const history = transcriptRef.current.length > 0 ? transcriptRef.current : transcript;
-      if (!isHindi) {
-        for (const m of history) {
-          if (m.role === 'user' && /[\u0900-\u097F]/.test(m.content)) {
-            isHindi = true;
-            break;
-          }
-        }
-      }
-      if (!isHindi) {
-        const lower = userText.toLowerCase();
-        if (
-          lower.includes('dhanyawad') ||
-          lower.includes('shukriya') ||
-          lower.includes('kardo') ||
-          lower.includes('karni') ||
-          lower.includes('hai') ||
-          lower.includes('bata')
-        ) {
-          isHinglish = true;
-        }
-      }
-
-      let ackText = "You're welcome! Your booking is confirmed.";
-      if (isHindi) {
-        ackText = 'आपका स्वागत है! आपकी बुकिंग कन्फर्म हो चुकी है। धन्यवाद!';
-      } else if (isHinglish) {
-        ackText = 'Welcome! Aapki booking confirm ho chuki hai. Dhanyawad!';
-      }
-
-      const tempAssistantMsg: TranscriptMessage = {
-        role: 'assistant',
-        content: ackText,
-        timestamp: new Date().toISOString(),
-      };
-
       setTranscript((prev) => {
-        const next = [...prev, tempUserMsg, tempAssistantMsg];
+        const next = [...prev, tempUserMsg];
         transcriptRef.current = next;
         return next;
       });
-      setInputMessage('');
-
-      if (mode === 'voice' && voiceSessionActiveRef.current) {
-        await playTtsAudio(ackText);
-      } else {
-        setVoiceState('IDLE');
-      }
-      return;
     }
-
-    const tempUserMsg: TranscriptMessage = {
-      role: 'user',
-      content: userText,
-      timestamp: new Date().toISOString(),
-    };
-    setTranscript((prev) => {
-      const next = [...prev, tempUserMsg];
-      transcriptRef.current = next;
-      return next;
-    });
 
     try {
       if (mode === 'text') setLoading(true);
       if (mode === 'voice') setVoiceState('THINKING');
 
+      const tAiStart = performance.now();
+      turnPerfRef.current.tAiStart = tAiStart;
+      console.log('[PERF] 7. AI request started');
+      if (turnPerfRef.current.tTranscript) {
+        console.log(`[PERF] transcript → AI start: ${Math.round(tAiStart - turnPerfRef.current.tTranscript)}ms`);
+      }
       console.log('[VOICE] AI request started');
 
       const res = await fetchWithTimeout('/api/ai/chat', {
@@ -470,13 +494,46 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
       }
 
       const data = await res.json();
+      const tAiResponse = performance.now();
+      turnPerfRef.current.tAiResponse = tAiResponse;
+      console.log('[PERF] 8. AI response received');
+      if (turnPerfRef.current.tAiStart) {
+        const aiDuration = Math.round(tAiResponse - turnPerfRef.current.tAiStart);
+        console.log(`[PERF] AI start → AI response: ${aiDuration}ms`);
+        console.log(`[PERF] AI: ${aiDuration}ms`);
+      }
 
       if (!res.ok) {
         throw new Error(data.error || `Failed to get AI response (status ${res.status})`);
       }
 
-      setTranscript(data.transcript || []);
-      transcriptRef.current = data.transcript || [];
+      console.log('[VOICE][TTS-DEBUG] AI reply received:', data.reply, {
+        sessionId,
+        recordingSessionId: recordingSessionIdRef.current,
+        voiceSessionActive: voiceSessionActiveRef.current,
+        mode,
+        workflowComplete: data.workflowComplete,
+      });
+
+      let updatedTranscript: TranscriptMessage[] = data.transcript || [];
+      const hasUserMsg = updatedTranscript.some(
+        (m: TranscriptMessage) => m.role === 'user' && m.content === userText.trim()
+      );
+      if (!hasUserMsg && userText.trim()) {
+        const userMsgObj: TranscriptMessage = {
+          role: 'user',
+          content: userText.trim(),
+          timestamp: new Date().toISOString(),
+        };
+        if (updatedTranscript.length > 0 && updatedTranscript[updatedTranscript.length - 1].role === 'assistant') {
+          const lastAssistant = updatedTranscript[updatedTranscript.length - 1];
+          updatedTranscript = [...updatedTranscript.slice(0, -1), userMsgObj, lastAssistant];
+        } else {
+          updatedTranscript = [...updatedTranscript, userMsgObj];
+        }
+      }
+      setTranscript(updatedTranscript);
+      transcriptRef.current = updatedTranscript;
       setCollectedData(data.collectedData || {});
       setMissingFields(data.missingFields || []);
       setPriority(data.priority || 'normal');
@@ -492,9 +549,17 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
       // If in Voice mode, synthesize and play TTS for AI response
       if (mode === 'voice' && voiceSessionActiveRef.current) {
         if (data.reply) {
+          console.log('[VOICE][TTS-DEBUG] playTtsAudio called:', {
+            reply: data.reply,
+            sessionId,
+            recordingSessionId: recordingSessionIdRef.current,
+          });
           await playTtsAudio(data.reply);
+          if (workflowCompleteRef.current) {
+            endVoiceSession();
+          }
         } else if (!data.workflowComplete) {
-          console.log('[VOICE] restarting listener');
+          console.log('[VOICE][TTS-DEBUG] listener restart requested (no reply to speak)');
           await startRecording();
         } else {
           endVoiceSession();
@@ -527,6 +592,7 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
   // TEXT MODE SUBMIT
   function handleTextSubmit(e?: React.FormEvent) {
     if (e) e.preventDefault();
+    if (workflowCompleteRef.current) return;
     const currentConvId = conversationIdRef.current || conversationId;
     if (!inputMessage.trim() || loading || !currentConvId) return;
 
@@ -535,13 +601,443 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
     processUserMessage(userText);
   }
 
-  // VOICE MODE: PLAY TTS AUDIO (PROMISE WRAPPED, LEAK-PROOF, STRICT MICROPHONE ISOLATION)
-  async function playTtsAudio(textToSpeak: string): Promise<void> {
-    const sessionId = recordingSessionIdRef.current;
+  // HELPER: Query browser audio recording MIME type
+  function getSupportedMimeType(): string {
+    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported) {
+      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+        return 'audio/webm;codecs=opus';
+      } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+        return 'audio/webm';
+      } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+        return 'audio/mp4';
+      } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
+        return 'audio/ogg;codecs=opus';
+      } else if (MediaRecorder.isTypeSupported('audio/ogg')) {
+        return 'audio/ogg';
+      }
+    }
+    return 'audio/webm';
+  }
+
+  // HELPER: Initialize Web Audio API Analyser for VAD (reusing open context)
+  function setupAudioContextAndAnalyser(stream: MediaStream) {
+    const AudioCtxClass =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+
+    if (!AudioCtxClass) return;
+
+    if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+      try {
+        audioContextRef.current = new AudioCtxClass();
+      } catch (e) {
+        console.warn('[VOICE] Error creating AudioContext:', e);
+        return;
+      }
+    }
+
+    if (audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume().catch(() => {});
+    }
+
+    if (!analyserRef.current && audioContextRef.current) {
+      try {
+        const analyser = audioContextRef.current.createAnalyser();
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.2;
+        analyserRef.current = analyser;
+      } catch (e) {
+        console.warn('[VOICE] Error creating AnalyserNode:', e);
+        return;
+      }
+    }
+
+    if (audioContextRef.current && analyserRef.current) {
+      try {
+        if (mediaStreamSourceRef.current) {
+          try {
+            mediaStreamSourceRef.current.disconnect();
+          } catch (e) {}
+          mediaStreamSourceRef.current = null;
+        }
+        const source = audioContextRef.current.createMediaStreamSource(stream);
+        source.connect(analyserRef.current);
+        mediaStreamSourceRef.current = source;
+      } catch (e) {
+        console.warn('[VOICE] Error connecting stream to AnalyserNode:', e);
+      }
+    }
+  }
+
+  // HELPER: Acquire or reuse persistent MediaStream for continuous conversation & barge-in
+  async function ensureMicrophoneStream(): Promise<MediaStream> {
+    const existing = mediaStreamRef.current;
+    if (
+      existing &&
+      existing.active &&
+      existing.getAudioTracks().some((t) => t.readyState === 'live' && t.enabled)
+    ) {
+      setupAudioContextAndAnalyser(existing);
+      return existing;
+    }
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('Microphone recording is not supported in this browser.');
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+
+    mediaStreamRef.current = stream;
+    setupAudioContextAndAnalyser(stream);
+    return stream;
+  }
+
+  // BARGE-IN: Cancel tentative recorder if vocal energy was transient (cough/click)
+  function cancelBargeInCapture() {
+    lastBargeInCancelTimeRef.current = Date.now();
+    isStartingTentativeRef.current = false;
+    if (tentativeRecorderRef.current) {
+      try {
+        tentativeRecorderRef.current.onstop = null;
+        if (tentativeRecorderRef.current.state !== 'inactive') {
+          tentativeRecorderRef.current.stop();
+        }
+      } catch (e) {}
+      tentativeRecorderRef.current = null;
+    }
+    tentativeChunksRef.current = [];
+    bargeInStartTimeRef.current = null;
+    bargeInLastHighTimeRef.current = null;
+  }
+
+  // BARGE-IN: Tentatively start capturing at speech onset so first words are never lost
+  function startBargeInCapture() {
+    if (workflowCompleteRef.current) return;
+    if (tentativeRecorderRef.current && tentativeRecorderRef.current.state !== 'inactive') {
+      return;
+    }
+    if (isStartingTentativeRef.current) return;
+    if (!mediaStreamRef.current) return;
+
+    // Cooldown check: prevent rapid start/stop flutter
+    if (Date.now() - lastBargeInCancelTimeRef.current < 200) {
+      return;
+    }
 
     try {
-      setVoiceState('SPEAKING');
-      console.log('[VOICE] TTS request started');
+      isStartingTentativeRef.current = true;
+      const selectedMimeType = getSupportedMimeType();
+      const tentativeRecorder = new MediaRecorder(mediaStreamRef.current, { mimeType: selectedMimeType });
+      tentativeChunksRef.current = [];
+
+      tentativeRecorder.ondataavailable = (event: BlobEvent) => {
+        if (event.data && event.data.size > 0) {
+          tentativeChunksRef.current.push(event.data);
+        }
+      };
+
+      // Inactive onstop initially; confirmBargeIn attaches the promotion handler
+      tentativeRecorder.onstop = null;
+
+      tentativeRecorderRef.current = tentativeRecorder;
+      tentativeRecorder.start(100);
+      console.log('[VOICE][BARGE] recorder started');
+    } catch (err) {
+      console.warn('[VOICE] Error starting tentative barge-in recorder:', err);
+      tentativeRecorderRef.current = null;
+    } finally {
+      isStartingTentativeRef.current = false;
+    }
+  }
+
+  // BARGE-IN: Execute interruption, halt assistant audio, and promote recorder
+  function confirmBargeIn() {
+    if (workflowCompleteRef.current) {
+      console.log('[VOICE][BARGE] Ignored barge-in: workflow is already complete');
+      return;
+    }
+    console.log('[VOICE][BARGE] speech confirmed');
+    console.log('[VOICE][BARGE] interruption confirmed');
+    ttsInterruptedRef.current = true;
+    isAssistantSpeakingRef.current = false;
+    isListeningStoppingRef.current = false;
+    bargeInStartTimeRef.current = null;
+    bargeInLastHighTimeRef.current = null;
+
+    // 1. Immediately pause and discard active TTS audio
+    if (activeAudioRef.current) {
+      try {
+        activeAudioRef.current.pause();
+        activeAudioRef.current.currentTime = 0;
+        activeAudioRef.current.src = '';
+      } catch (e) {
+        console.warn('[VOICE] Error pausing activeAudio on barge-in:', e);
+      }
+      activeAudioRef.current = null;
+    }
+
+    // 2. Unblock any awaiting TTS playback promise
+    if (activeTtsResolveRef.current) {
+      try {
+        activeTtsResolveRef.current();
+      } catch (e) {}
+      activeTtsResolveRef.current = null;
+    }
+
+    // 3. Cancel any browser speechSynthesis
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch (e) {}
+    }
+
+    console.log('[VOICE][BARGE] TTS cancelled');
+
+    // 4. Invalidate old assistant turn and generate new turn session ID
+    const bargeInTurnId = ++recordingSessionIdRef.current;
+
+    // 5. Transition UI and state to RECORDING
+    setVoiceState('RECORDING');
+    setIsUserSpeaking(true);
+    speechStartedRef.current = true;
+    hasValidSpeechRef.current = true;
+    speechStartTimeRef.current = Date.now();
+    silenceStartTimeRef.current = null;
+
+    // 6. Promote tentative recorder to active mediaRecorderRef with completion handler
+    const recorder = tentativeRecorderRef.current;
+    tentativeRecorderRef.current = null;
+
+    if (recorder) {
+      mediaRecorderRef.current = recorder;
+
+      recorder.onstop = async () => {
+        const tRecorderStop = performance.now();
+        turnPerfRef.current.tRecorderStop = tRecorderStop;
+        console.log('[PERF] 2. MediaRecorder stopped (barge-in)');
+        if (turnPerfRef.current.tSpeechEnd) {
+          console.log(`[PERF] speech end → recorder stop: ${Math.round(tRecorderStop - turnPerfRef.current.tSpeechEnd)}ms`);
+        }
+        console.log('[VOICE][BARGE] recorder stopped');
+        mediaRecorderRef.current = null;
+
+        if (vadRafIdRef.current) {
+          cancelAnimationFrame(vadRafIdRef.current);
+          vadRafIdRef.current = null;
+        }
+
+        if (bargeInTurnId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
+          console.warn(`[VOICE] Discarding stopped barge-in recorder from stale session #${bargeInTurnId}`);
+          return;
+        }
+
+        const actualMimeType = recorder.mimeType || getSupportedMimeType();
+        const audioBlob = new Blob(tentativeChunksRef.current, { type: actualMimeType });
+        tentativeChunksRef.current = [];
+        const tAudioBlob = performance.now();
+        turnPerfRef.current.tAudioBlob = tAudioBlob;
+        console.log('[PERF] 3. Audio blob created');
+        if (turnPerfRef.current.tRecorderStop) {
+          console.log(`[PERF] recorder stop → audio blob: ${Math.round(tAudioBlob - turnPerfRef.current.tRecorderStop)}ms`);
+        }
+
+        const hadSpeech = hasValidSpeechRef.current || speechStartedRef.current;
+        speechStartedRef.current = false;
+        hasValidSpeechRef.current = false;
+
+        if (audioBlob.size < 1200 || !hadSpeech) {
+          console.log(`[VOICE] Ambient silence on barge-in turn (size: ${audioBlob.size}b, speechDetected: ${hadSpeech}). Re-opening listener.`);
+          if (voiceSessionActiveRef.current && !workflowCompleteRef.current) {
+            startRecording();
+          } else {
+            setVoiceState('IDLE');
+          }
+          return;
+        }
+
+        console.log('[VOICE][BARGE] interrupt audio sent to STT');
+        await processVoiceRecording(audioBlob, actualMimeType, bargeInTurnId);
+      };
+    }
+  }
+
+  // UNIFIED VAD MONITORING LOOP: Handles both barge-in monitoring and turn silence detection
+  function startVadLoop(stream: MediaStream) {
+    if (vadRafIdRef.current) {
+      cancelAnimationFrame(vadRafIdRef.current);
+      vadRafIdRef.current = null;
+    }
+
+    const currentLoopId = ++vadLoopIdRef.current;
+    isListeningStoppingRef.current = false;
+
+    setupAudioContextAndAnalyser(stream);
+    const analyser = analyserRef.current;
+    if (!analyser) return;
+
+    const timeDomainData = new Float32Array(analyser.fftSize);
+
+    const vadLoop = () => {
+      if (
+        currentLoopId !== vadLoopIdRef.current ||
+        !voiceSessionActiveRef.current ||
+        isListeningStoppingRef.current
+      ) {
+        return;
+      }
+
+      analyser.getFloatTimeDomainData(timeDomainData);
+      let sumSquares = 0;
+      for (let i = 0; i < timeDomainData.length; i++) {
+        sumSquares += timeDomainData[i] * timeDomainData[i];
+      }
+      const rms = Math.sqrt(sumSquares / timeDomainData.length);
+      const now = Date.now();
+
+      // MODE 1: ASSISTANT IS CURRENTLY SPEAKING (Barge-In Detection with Higher Threshold & Sustained Vocal Guard)
+      if (isAssistantSpeakingRef.current) {
+        if (rms >= VAD_BARGE_IN_RMS_THRESHOLD) {
+          if (now - lastBargeInCancelTimeRef.current < 200) {
+            vadRafIdRef.current = requestAnimationFrame(vadLoop);
+            return;
+          }
+
+          if (!bargeInStartTimeRef.current) {
+            bargeInStartTimeRef.current = now;
+            bargeInLastHighTimeRef.current = now;
+            console.log('[VOICE][BARGE] speech onset');
+            startBargeInCapture();
+          } else {
+            bargeInLastHighTimeRef.current = now;
+            if (now - bargeInStartTimeRef.current >= VAD_BARGE_IN_MIN_DURATION_MS) {
+              confirmBargeIn();
+            }
+          }
+        } else if (bargeInStartTimeRef.current) {
+          const highTime = bargeInLastHighTimeRef.current || bargeInStartTimeRef.current;
+          if (now - highTime > VAD_BARGE_IN_DIP_TOLERANCE_MS) {
+            cancelBargeInCapture();
+          }
+        }
+
+        vadRafIdRef.current = requestAnimationFrame(vadLoop);
+        return;
+      }
+
+      // MODE 2: USER TURN ACTIVE RECORDING (Silence & Turn Completion)
+      // Guard: Silence detection must only run if a user recording is actively in progress
+      if (!mediaRecorderRef.current || mediaRecorderRef.current.state !== 'recording') {
+        vadRafIdRef.current = requestAnimationFrame(vadLoop);
+        return;
+      }
+
+      if (rms >= VAD_SPEECH_RMS_THRESHOLD) {
+        if (!speechStartedRef.current) {
+          speechStartedRef.current = true;
+          speechStartTimeRef.current = now;
+          setIsUserSpeaking(true);
+          console.log('[VOICE] VAD speech detected');
+        } else {
+          setIsUserSpeaking(true);
+        }
+        if (now - (speechStartTimeRef.current || now) >= VAD_MIN_SPEECH_DURATION_MS) {
+          hasValidSpeechRef.current = true;
+        }
+        silenceStartTimeRef.current = null;
+      } else if (speechStartedRef.current) {
+        setIsUserSpeaking(false);
+        const speechDuration = now - (speechStartTimeRef.current || now);
+
+        if (speechDuration >= VAD_MIN_SPEECH_DURATION_MS) {
+          hasValidSpeechRef.current = true;
+          if (!silenceStartTimeRef.current) {
+            silenceStartTimeRef.current = now;
+          } else if (now - silenceStartTimeRef.current >= VAD_SILENCE_DURATION_MS) {
+            const tSpeechEnd = performance.now();
+            turnPerfRef.current = { tSpeechEnd };
+            console.log('[PERF] 1. User speech/silence detection completed');
+            console.log('[VOICE] silence detected');
+            stopListeningTurn();
+            return;
+          }
+        } else {
+          // If vocal energy was a transient click/pop (< 350ms) and has returned to silence for > 800ms,
+          // discard the false onset so silence does not linger until max turn duration
+          if (!silenceStartTimeRef.current) {
+            silenceStartTimeRef.current = now;
+          } else if (now - silenceStartTimeRef.current >= 800) {
+            speechStartedRef.current = false;
+            speechStartTimeRef.current = null;
+            silenceStartTimeRef.current = null;
+            hasValidSpeechRef.current = false;
+          }
+        }
+      }
+
+      // Safeguard: cap maximum single turn speech duration to 25s
+      if (
+        speechStartedRef.current &&
+        speechStartTimeRef.current &&
+        now - speechStartTimeRef.current >= VAD_MAX_TURN_DURATION_MS
+      ) {
+        const tSpeechEnd = performance.now();
+        turnPerfRef.current = { tSpeechEnd };
+        console.log('[PERF] 1. User speech/silence detection completed (max turn duration)');
+        console.log('[VOICE] max turn duration reached, stopping recorder');
+        stopListeningTurn();
+        return;
+      }
+
+      vadRafIdRef.current = requestAnimationFrame(vadLoop);
+    };
+
+    vadRafIdRef.current = requestAnimationFrame(vadLoop);
+  }
+
+  // VOICE MODE: PLAY TTS AUDIO WITH BARGE-IN MONITORING
+  async function playTtsAudio(textToSpeak: string): Promise<void> {
+    const sessionId = recordingSessionIdRef.current;
+    ttsInterruptedRef.current = false;
+    bargeInStartTimeRef.current = null;
+    bargeInLastHighTimeRef.current = null;
+    isListeningStoppingRef.current = false;
+    speechStartedRef.current = false;
+    speechStartTimeRef.current = null;
+    silenceStartTimeRef.current = null;
+
+    console.log('[VOICE][TTS-DEBUG] playTtsAudio called:', {
+      textToSpeak,
+      sessionId,
+      recordingSessionId: recordingSessionIdRef.current,
+      voiceSessionActive: voiceSessionActiveRef.current,
+      ttsInterrupted: ttsInterruptedRef.current,
+      voiceState,
+      hasActiveAudio: Boolean(activeAudioRef.current),
+      isAssistantSpeaking: isAssistantSpeakingRef.current,
+    });
+
+    try {
+      const tTtsStart = performance.now();
+      turnPerfRef.current.tTtsStart = tTtsStart;
+      console.log('[PERF] 9. TTS request started');
+      if (turnPerfRef.current.tAiResponse) {
+        console.log(`[PERF] AI response → TTS start: ${Math.round(tTtsStart - turnPerfRef.current.tAiResponse)}ms`);
+      }
+      console.log('[VOICE][TTS-DEBUG] TTS request started');
+
+      // Pre-acquire microphone stream so it is ready for barge-in
+      let micStream: MediaStream | null = null;
+      try {
+        micStream = await ensureMicrophoneStream();
+      } catch (micErr) {
+        console.warn('[VOICE] Could not pre-initialize mic for barge-in monitoring:', micErr);
+      }
 
       const res = await fetchWithTimeout('/api/voice/speak', {
         method: 'POST',
@@ -549,11 +1045,27 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
         body: JSON.stringify({ text: textToSpeak }),
       }, 12000);
 
-      console.log('[VOICE] TTS response received');
+      console.log('[VOICE][TTS-DEBUG] TTS response status:', res.status);
 
-      // If call session was terminated while awaiting TTS response, abort immediately
-      if (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
-        setVoiceState('IDLE');
+      // If call session was terminated or interrupted while awaiting TTS response, abort immediately
+      if (
+        sessionId !== recordingSessionIdRef.current ||
+        !voiceSessionActiveRef.current ||
+        ttsInterruptedRef.current
+      ) {
+        console.warn('[VOICE][TTS-DEBUG] TTS aborted after fetch due to condition:', {
+          sessionIdMatches: sessionId === recordingSessionIdRef.current,
+          sessionId,
+          recordingSessionId: recordingSessionIdRef.current,
+          voiceSessionActive: voiceSessionActiveRef.current,
+          ttsInterrupted: ttsInterruptedRef.current,
+          voiceState,
+          hasActiveAudio: Boolean(activeAudioRef.current),
+        });
+        isAssistantSpeakingRef.current = false;
+        if (!ttsInterruptedRef.current) {
+          setVoiceState('IDLE');
+        }
         return;
       }
 
@@ -567,13 +1079,29 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
         if (voiceSessionActiveRef.current) {
           // If browser SpeechSynthesis is supported, speak the response aloud as seamless fallback
           if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+            const tTtsResponse = performance.now();
+            turnPerfRef.current.tTtsResponse = tTtsResponse;
+            console.log('[PERF] 10. TTS response received (SpeechSynthesis)');
+            if (turnPerfRef.current.tTtsStart) {
+              const ttsDuration = Math.round(tTtsResponse - turnPerfRef.current.tTtsStart);
+              console.log(`[PERF] TTS start → TTS response: ${ttsDuration}ms`);
+              console.log(`[PERF] TTS: ${ttsDuration}ms`);
+            }
             return new Promise<void>((resolve) => {
               let resolved = false;
               const cleanup = (shouldAutoRecord: boolean) => {
                 if (resolved) return;
                 resolved = true;
+                activeTtsResolveRef.current = null;
+                isAssistantSpeakingRef.current = false;
                 if (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
-                  setVoiceState('IDLE');
+                  if (!ttsInterruptedRef.current) setVoiceState('IDLE');
+                  console.log('[VOICE][TTS-DEBUG] TTS promise resolved (stale/inactive session)');
+                  resolve();
+                  return;
+                }
+                if (ttsInterruptedRef.current) {
+                  console.log('[VOICE][TTS-DEBUG] TTS promise resolved (interrupted)');
                   resolve();
                   return;
                 }
@@ -582,13 +1110,18 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
                   resolve();
                   return;
                 }
+                console.log('[VOICE][TTS-DEBUG] TTS promise resolved');
                 if (shouldAutoRecord) {
-                  console.log('[VOICE] restarting listener');
+                  console.log('[VOICE][TTS-DEBUG] listener restart requested');
                   startRecording();
                 } else {
                   setVoiceState('IDLE');
                 }
                 resolve();
+              };
+
+              activeTtsResolveRef.current = () => {
+                cleanup(false);
               };
 
               try {
@@ -598,25 +1131,48 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
                 utterance.rate = 1.0;
 
                 utterance.onstart = () => {
-                  console.log('[VOICE] audio playback started');
+                  const tPlaybackStart = performance.now();
+                  turnPerfRef.current.tPlaybackStart = tPlaybackStart;
+                  console.log('[PERF] 11. Audio playback started');
+                  if (turnPerfRef.current.tTtsResponse) {
+                    console.log(`[PERF] TTS response → playback start: ${Math.round(tPlaybackStart - turnPerfRef.current.tTtsResponse)}ms`);
+                  }
+                  if (turnPerfRef.current.tSpeechEnd) {
+                    const totalTurnLatency = Math.round(tPlaybackStart - turnPerfRef.current.tSpeechEnd);
+                    console.log(`[PERF] total speech end → playback start: ${totalTurnLatency}ms`);
+                    console.log(`[PERF] Total turn latency: ${totalTurnLatency}ms`);
+                  }
+                  console.log('[VOICE][TTS-DEBUG] audio playback started');
+                  setVoiceState('SPEAKING');
+                  isAssistantSpeakingRef.current = true;
+                  if (micStream && voiceSessionActiveRef.current && sessionId === recordingSessionIdRef.current && !workflowCompleteRef.current) {
+                    console.log('[VOICE][BARGE] VAD monitoring active');
+                    startVadLoop(micStream);
+                  }
                 };
                 utterance.onend = () => {
-                  console.log('[VOICE] audio playback ended');
+                  const tPlaybackEnd = performance.now();
+                  turnPerfRef.current.tPlaybackEnd = tPlaybackEnd;
+                  console.log('[PERF] 12. Audio playback ended');
+                  console.log('[VOICE][TTS-DEBUG] audio playback ended');
                   cleanup(true);
                 };
-                utterance.onerror = () => {
+                utterance.onerror = (e) => {
+                  console.warn('[VOICE][TTS-DEBUG] audio playback error:', e);
                   cleanup(true);
                 };
+                console.log('[VOICE][TTS-DEBUG] audio.play() called (SpeechSynthesis)');
                 window.speechSynthesis.speak(utterance);
               } catch {
                 cleanup(true);
               }
             });
           } else {
+            isAssistantSpeakingRef.current = false;
             if (workflowCompleteRef.current) {
               endVoiceSession();
             } else {
-              console.log('[VOICE] restarting listener');
+              console.log('[VOICE][TTS-DEBUG] listener restart requested (after TTS failure)');
               setTimeout(() => {
                 if (voiceSessionActiveRef.current && sessionId === recordingSessionIdRef.current && !workflowCompleteRef.current) {
                   startRecording();
@@ -625,20 +1181,32 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
             }
           }
         } else {
+          isAssistantSpeakingRef.current = false;
           setVoiceState('IDLE');
         }
         return;
       }
 
       const audioBlob = await res.blob();
+      const tTtsResponse = performance.now();
+      turnPerfRef.current.tTtsResponse = tTtsResponse;
+      console.log('[PERF] 10. TTS response received');
+      if (turnPerfRef.current.tTtsStart) {
+        const ttsDuration = Math.round(tTtsResponse - turnPerfRef.current.tTtsStart);
+        console.log(`[PERF] TTS start → TTS response: ${ttsDuration}ms`);
+        console.log(`[PERF] TTS: ${ttsDuration}ms`);
+      }
+      console.log('[VOICE][TTS-DEBUG] TTS blob size:', audioBlob ? audioBlob.size : 0);
+
       if (!audioBlob || audioBlob.size === 0) {
         console.warn('[VOICE] TTS API returned 0-byte audio blob.');
         setTtsUnavailable(true);
+        isAssistantSpeakingRef.current = false;
         if (voiceSessionActiveRef.current) {
           if (workflowCompleteRef.current) {
             endVoiceSession();
           } else {
-            console.log('[VOICE] restarting listener');
+            console.log('[VOICE][TTS-DEBUG] listener restart requested (empty blob recovery)');
             setTimeout(() => {
               if (voiceSessionActiveRef.current && sessionId === recordingSessionIdRef.current && !workflowCompleteRef.current) {
                 startRecording();
@@ -652,8 +1220,24 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
       }
 
       // Check race condition before playing
-      if (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
-        setVoiceState('IDLE');
+      if (
+        sessionId !== recordingSessionIdRef.current ||
+        !voiceSessionActiveRef.current ||
+        ttsInterruptedRef.current
+      ) {
+        console.warn('[VOICE][TTS-DEBUG] TTS aborted before playback due to condition:', {
+          sessionIdMatches: sessionId === recordingSessionIdRef.current,
+          sessionId,
+          recordingSessionId: recordingSessionIdRef.current,
+          voiceSessionActive: voiceSessionActiveRef.current,
+          ttsInterrupted: ttsInterruptedRef.current,
+          voiceState,
+          hasActiveAudio: Boolean(activeAudioRef.current),
+        });
+        isAssistantSpeakingRef.current = false;
+        if (!ttsInterruptedRef.current) {
+          setVoiceState('IDLE');
+        }
         return;
       }
 
@@ -661,9 +1245,14 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
       setVoiceError(null);
 
       const audioUrl = URL.createObjectURL(audioBlob);
+      console.log('[VOICE][TTS-DEBUG] audio object URL created:', audioUrl);
 
       if (activeAudioRef.current) {
-        activeAudioRef.current.pause();
+        try {
+          activeAudioRef.current.pause();
+          activeAudioRef.current.currentTime = 0;
+          activeAudioRef.current.src = '';
+        } catch (e) {}
         activeAudioRef.current = null;
       }
 
@@ -676,6 +1265,12 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
         const cleanup = (shouldAutoRecord: boolean) => {
           if (resolved) return;
           resolved = true;
+          activeTtsResolveRef.current = null;
+          clearTimeout(playbackTimeout);
+          isAssistantSpeakingRef.current = false;
+          if (!ttsInterruptedRef.current) {
+            cancelBargeInCapture();
+          }
           URL.revokeObjectURL(audioUrl);
           if (activeAudioRef.current === audio) {
             activeAudioRef.current = null;
@@ -683,7 +1278,15 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
 
           // Check if session was ended while audio was speaking
           if (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
-            setVoiceState('IDLE');
+            if (!ttsInterruptedRef.current) setVoiceState('IDLE');
+            console.log('[VOICE][TTS-DEBUG] TTS promise resolved (stale/inactive session)');
+            resolve();
+            return;
+          }
+
+          // If interrupted by barge-in, the barge-in recording is ALREADY active; do not restart listener!
+          if (ttsInterruptedRef.current) {
+            console.log('[VOICE][TTS-DEBUG] TTS promise resolved (interrupted by barge-in)');
             resolve();
             return;
           }
@@ -695,8 +1298,9 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
             return;
           }
 
+          console.log('[VOICE][TTS-DEBUG] TTS promise resolved');
           if (shouldAutoRecord) {
-            console.log('[VOICE] restarting listener');
+            console.log('[VOICE][TTS-DEBUG] listener restart requested');
             startRecording();
           } else {
             setVoiceState('IDLE');
@@ -704,17 +1308,41 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
           resolve();
         };
 
+        activeTtsResolveRef.current = () => {
+          cleanup(false);
+        };
+
         audio.onplay = () => {
-          console.log('[VOICE] audio playback started');
+          const tPlaybackStart = performance.now();
+          turnPerfRef.current.tPlaybackStart = tPlaybackStart;
+          console.log('[PERF] 11. Audio playback started');
+          if (turnPerfRef.current.tTtsResponse) {
+            console.log(`[PERF] TTS response → playback start: ${Math.round(tPlaybackStart - turnPerfRef.current.tTtsResponse)}ms`);
+          }
+          if (turnPerfRef.current.tSpeechEnd) {
+            const totalTurnLatency = Math.round(tPlaybackStart - turnPerfRef.current.tSpeechEnd);
+            console.log(`[PERF] total speech end → playback start: ${totalTurnLatency}ms`);
+            console.log(`[PERF] Total turn latency: ${totalTurnLatency}ms`);
+          }
+          console.log('[VOICE][TTS-DEBUG] audio playback started');
+          setVoiceState('SPEAKING');
+          isAssistantSpeakingRef.current = true;
+          if (micStream && voiceSessionActiveRef.current && sessionId === recordingSessionIdRef.current && !workflowCompleteRef.current) {
+            console.log('[VOICE][BARGE] VAD monitoring active');
+            startVadLoop(micStream);
+          }
         };
 
         audio.onended = () => {
-          console.log('[VOICE] audio playback ended');
+          const tPlaybackEnd = performance.now();
+          turnPerfRef.current.tPlaybackEnd = tPlaybackEnd;
+          console.log('[PERF] 12. Audio playback ended');
+          console.log('[VOICE][TTS-DEBUG] audio playback ended');
           cleanup(true);
         };
 
         audio.onerror = (e) => {
-          console.warn('[VOICE] TTS audio playback error:', e);
+          console.warn('[VOICE][TTS-DEBUG] audio playback error:', e);
           setTtsUnavailable(true);
           cleanup(true);
         };
@@ -727,21 +1355,23 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
           }
         }, 30000);
 
+        console.log('[VOICE][TTS-DEBUG] audio.play() called');
         audio.play().catch((playErr) => {
           clearTimeout(playbackTimeout);
-          console.warn('[VOICE] TTS audio.play() rejected:', playErr);
+          console.warn('[VOICE][TTS-DEBUG] audio playback error:', playErr);
           setTtsUnavailable(true);
           cleanup(true);
         });
       });
     } catch (err) {
       console.warn('[VOICE] TTS Playback Exception:', err);
+      isAssistantSpeakingRef.current = false;
       setTtsUnavailable(true);
       if (sessionId === recordingSessionIdRef.current && voiceSessionActiveRef.current) {
         if (workflowCompleteRef.current) {
           endVoiceSession();
         } else {
-          console.log('[VOICE] restarting listener');
+          console.log('[VOICE][TTS-DEBUG] listener restart requested (exception recovery)');
           setTimeout(() => {
             if (voiceSessionActiveRef.current && sessionId === recordingSessionIdRef.current && !workflowCompleteRef.current) {
               startRecording();
@@ -759,6 +1389,9 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
     if (isListeningStoppingRef.current) return;
     isListeningStoppingRef.current = true;
     setIsUserSpeaking(false);
+    isAssistantSpeakingRef.current = false;
+    speechStartTimeRef.current = null;
+    silenceStartTimeRef.current = null;
 
     // Cancel VAD loop
     if (vadRafIdRef.current) {
@@ -776,17 +1409,7 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
         console.warn('[VOICE] Error stopping MediaRecorder in stopListeningTurn:', e);
       }
     } else {
-      // Fallback if recorder was already stopped or inactive
       console.log('[VOICE] recorder was not recording');
-      if (voiceSessionActiveRef.current && !workflowCompleteRef.current) {
-        console.log('[VOICE] restarting listener');
-        setTimeout(() => {
-          if (voiceSessionActiveRef.current && !workflowCompleteRef.current) {
-            startRecording();
-          }
-        }, 200);
-      }
-      return;
     }
     setVoiceState('TRANSCRIBING');
   }
@@ -798,6 +1421,13 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
 
   // VOICE MODE: START MICROPHONE LISTENING (HANDS-FREE VAD WITH AUTOMATIC SILENCE DETECTION)
   async function startRecording() {
+    const tListenerRestart = performance.now();
+    turnPerfRef.current.tListenerRestart = tListenerRestart;
+    console.log('[PERF] 13. Listener restarted');
+    if (turnPerfRef.current.tPlaybackEnd) {
+      console.log(`[PERF] playback end → listener restart: ${Math.round(tListenerRestart - turnPerfRef.current.tPlaybackEnd)}ms`);
+    }
+
     if (!voiceSessionActiveRef.current) return;
     if (workflowCompleteRef.current) {
       endVoiceSession();
@@ -816,36 +1446,21 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
       const currentSessionId = ++recordingSessionIdRef.current;
       isListeningStoppingRef.current = false;
       speechStartedRef.current = false;
+      hasValidSpeechRef.current = false;
       speechStartTimeRef.current = null;
       silenceStartTimeRef.current = null;
       setIsUserSpeaking(false);
+      isAssistantSpeakingRef.current = false;
+      bargeInStartTimeRef.current = null;
+      bargeInLastHighTimeRef.current = null;
 
-      // 2. Cancel any active VAD loop
-      if (vadRafIdRef.current) {
-        cancelAnimationFrame(vadRafIdRef.current);
-        vadRafIdRef.current = null;
-      }
+      // 2. Cancel tentative barge-in recorder if any
+      cancelBargeInCapture();
 
-      // 3. Close any previous AudioContext
-      if (audioContextRef.current) {
-        try {
-          if (audioContextRef.current.state !== 'closed') {
-            audioContextRef.current.close();
-          }
-        } catch {}
-        audioContextRef.current = null;
-      }
-      analyserRef.current = null;
-
-      // 4. Pause/cleanup active TTS audio if playing
-      if (activeAudioRef.current) {
-        activeAudioRef.current.pause();
-        activeAudioRef.current = null;
-      }
-
-      // 5. Ensure any existing MediaRecorder is stopped & cleaned up
+      // 3. Stop previous MediaRecorder if still active
       if (mediaRecorderRef.current) {
         try {
+          mediaRecorderRef.current.onstop = null;
           if (mediaRecorderRef.current.state !== 'inactive') {
             mediaRecorderRef.current.stop();
           }
@@ -855,145 +1470,34 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
         mediaRecorderRef.current = null;
       }
 
-      // 6. Ensure any existing MediaStream tracks are stopped
-      if (mediaStreamRef.current) {
+      // 4. Pause/cleanup active TTS audio if playing
+      if (activeAudioRef.current) {
         try {
-          mediaStreamRef.current.getTracks().forEach((track) => track.stop());
-        } catch (e) {
-          console.warn('[VOICE] Error stopping previous MediaStream:', e);
-        }
-        mediaStreamRef.current = null;
+          activeAudioRef.current.pause();
+        } catch (e) {}
+        activeAudioRef.current = null;
       }
 
       setVoiceError(null);
       setTtsUnavailable(false);
 
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error('Microphone recording is not supported in this browser.');
-      }
+      // 5. Ensure active microphone stream and analyser (reusing healthy stream if already open)
+      const stream = await ensureMicrophoneStream();
 
-      // 7. Request a fresh audio stream with echo cancellation & noise suppression
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-
-      // Verify session was not cancelled or invalidated during getUserMedia prompt
+      // Verify session was not cancelled or invalidated during getUserMedia
       if (currentSessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
-        stream.getTracks().forEach((track) => track.stop());
         return;
       }
 
-      mediaStreamRef.current = stream;
+      // 6. Start / refresh the single unified VAD loop
+      startVadLoop(stream);
 
-      // 8. Initialize Web Audio API Analyser for Voice Activity & Silence Detection
-      const AudioCtxClass =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-
-      if (AudioCtxClass) {
-        try {
-          const audioCtx = new AudioCtxClass();
-          audioContextRef.current = audioCtx;
-          const analyser = audioCtx.createAnalyser();
-          analyser.fftSize = 512;
-          analyser.smoothingTimeConstant = 0.2;
-          analyserRef.current = analyser;
-
-          const source = audioCtx.createMediaStreamSource(stream);
-          source.connect(analyser);
-
-          const timeDomainData = new Float32Array(analyser.fftSize);
-
-          // Real-time VAD Monitoring Loop
-          const vadLoop = () => {
-            if (
-              currentSessionId !== recordingSessionIdRef.current ||
-              !voiceSessionActiveRef.current ||
-              isListeningStoppingRef.current
-            ) {
-              return;
-            }
-
-            analyser.getFloatTimeDomainData(timeDomainData);
-            let sumSquares = 0;
-            for (let i = 0; i < timeDomainData.length; i++) {
-              sumSquares += timeDomainData[i] * timeDomainData[i];
-            }
-            const rms = Math.sqrt(sumSquares / timeDomainData.length);
-            const now = Date.now();
-
-            if (rms >= VAD_SPEECH_RMS_THRESHOLD) {
-              // Vocal speech detected
-              if (!speechStartedRef.current) {
-                speechStartedRef.current = true;
-                speechStartTimeRef.current = now;
-                setIsUserSpeaking(true);
-                console.log('[VOICE] VAD speech detected');
-              } else {
-                setIsUserSpeaking(true);
-              }
-              silenceStartTimeRef.current = null;
-            } else if (speechStartedRef.current) {
-              // User had started speaking, now in pause or silence
-              setIsUserSpeaking(false);
-              const speechDuration = now - (speechStartTimeRef.current || now);
-
-              if (speechDuration >= VAD_MIN_SPEECH_DURATION_MS) {
-                if (!silenceStartTimeRef.current) {
-                  silenceStartTimeRef.current = now;
-                } else if (now - silenceStartTimeRef.current >= VAD_SILENCE_DURATION_MS) {
-                  // Natural silence detected! Auto-complete user turn
-                  console.log('[VOICE] silence detected');
-                  stopListeningTurn();
-                  return;
-                }
-              }
-            }
-
-            // Safeguard: cap maximum single turn speech duration to 25s
-            if (
-              speechStartedRef.current &&
-              speechStartTimeRef.current &&
-              now - speechStartTimeRef.current >= VAD_MAX_TURN_DURATION_MS
-            ) {
-              console.log('[VOICE] silence detected');
-              stopListeningTurn();
-              return;
-            }
-
-            vadRafIdRef.current = requestAnimationFrame(vadLoop);
-          };
-
-          vadRafIdRef.current = requestAnimationFrame(vadLoop);
-        } catch (vadErr) {
-          console.warn('[VOICE] Web Audio API Analyser initialization notice:', vadErr);
-        }
-      }
-
-      // 9. Select best supported MIME type
-      let selectedMimeType = 'audio/webm';
-      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported) {
-        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
-          selectedMimeType = 'audio/webm;codecs=opus';
-        } else if (MediaRecorder.isTypeSupported('audio/webm')) {
-          selectedMimeType = 'audio/webm';
-        } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
-          selectedMimeType = 'audio/mp4';
-        } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
-          selectedMimeType = 'audio/ogg;codecs=opus';
-        } else if (MediaRecorder.isTypeSupported('audio/ogg')) {
-          selectedMimeType = 'audio/ogg';
-        }
-      }
-
+      // 7. Select best supported MIME type
+      const selectedMimeType = getSupportedMimeType();
       const recorder = new MediaRecorder(stream, { mimeType: selectedMimeType });
       mediaRecorderRef.current = recorder;
 
-      // 10. Dedicated per-session chunks array bound to this specific recording session
+      // 8. Dedicated per-session chunks array bound to this specific recording session
       const sessionChunks: Blob[] = [];
 
       recorder.ondataavailable = (event: BlobEvent) => {
@@ -1003,33 +1507,14 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
       };
 
       recorder.onstop = async () => {
+        const tRecorderStop = performance.now();
+        turnPerfRef.current.tRecorderStop = tRecorderStop;
+        console.log('[PERF] 2. MediaRecorder stopped');
+        if (turnPerfRef.current.tSpeechEnd) {
+          console.log(`[PERF] speech end → recorder stop: ${Math.round(tRecorderStop - turnPerfRef.current.tSpeechEnd)}ms`);
+        }
         console.log('[VOICE] recorder onstop fired');
-
-        // Disconnect & close AudioContext here AFTER recorder has stopped recording
-        if (audioContextRef.current) {
-          try {
-            if (audioContextRef.current.state !== 'closed') {
-              audioContextRef.current.close();
-            }
-          } catch (e) {
-            console.warn('[VOICE] Error closing AudioContext in onstop:', e);
-          }
-          audioContextRef.current = null;
-        }
-        analyserRef.current = null;
-
-        // Stop all microphone tracks immediately upon completion of turn
-        try {
-          stream.getTracks().forEach((track) => track.stop());
-        } catch (e) {
-          console.warn('[VOICE] Error stopping stream tracks in onstop:', e);
-        }
-        if (mediaStreamRef.current === stream) {
-          mediaStreamRef.current = null;
-        }
-        if (mediaRecorderRef.current === recorder) {
-          mediaRecorderRef.current = null;
-        }
+        mediaRecorderRef.current = null;
 
         // Clean up VAD monitoring loop
         if (vadRafIdRef.current) {
@@ -1045,11 +1530,21 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
 
         const actualMimeType = recorder.mimeType || selectedMimeType;
         const audioBlob = new Blob(sessionChunks, { type: actualMimeType });
-        console.log('[VOICE] audio blob created');
+        const tAudioBlob = performance.now();
+        turnPerfRef.current.tAudioBlob = tAudioBlob;
+        console.log('[PERF] 3. Audio blob created');
+        if (turnPerfRef.current.tRecorderStop) {
+          console.log(`[PERF] recorder stop → audio blob: ${Math.round(tAudioBlob - turnPerfRef.current.tRecorderStop)}ms`);
+        }
+        console.log('[VOICE] audio blob created, size:', audioBlob.size);
+
+        const hadSpeech = hasValidSpeechRef.current || speechStartedRef.current;
+        speechStartedRef.current = false;
+        hasValidSpeechRef.current = false;
 
         // If user didn't speak or segment is too small, silently re-open listener without breaking call
-        if (audioBlob.size < 500 || !speechStartedRef.current) {
-          console.log(`[VOICE] Ambient silence (size: ${audioBlob.size}b, speechDetected: ${speechStartedRef.current}). Re-opening listener.`);
+        if (audioBlob.size < 1200 || !hadSpeech) {
+          console.log(`[VOICE] Ambient silence (size: ${audioBlob.size}b, speechDetected: ${hadSpeech}). Re-opening listener.`);
           if (voiceSessionActiveRef.current && !workflowCompleteRef.current) {
             console.log('[VOICE] restarting listener');
             setTimeout(() => {
@@ -1111,6 +1606,13 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
         return;
       }
 
+      // If workflow has already completed, cleanly end the voice session and ignore further audio
+      if (workflowCompleteRef.current) {
+        console.log('[VOICE] Discarding transcribe request: workflow already complete');
+        endVoiceSession();
+        return;
+      }
+
       setVoiceState('TRANSCRIBING');
 
       // Determine established conversation language from transcript history
@@ -1124,8 +1626,34 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
           break;
         }
         const lower = text.toLowerCase();
-        if (lower.includes('mujhe') || lower.includes('karni') || lower.includes('bata') || lower.includes('chahiye')) {
+        if (
+          lower.includes('mujhe') ||
+          lower.includes('karni') ||
+          lower.includes('karna') ||
+          lower.includes('bata') ||
+          lower.includes('chahiye') ||
+          lower.includes('mera naam') ||
+          lower.includes('apka') ||
+          lower.includes('hai') ||
+          lower.includes('dhanyawad') ||
+          lower.includes('shukriya')
+        ) {
           establishedLang = 'hinglish';
+          break;
+        }
+        if (
+          lower.includes('hello') ||
+          lower.includes('hi') ||
+          lower.includes('appointment') ||
+          lower.includes('book') ||
+          lower.includes('doctor') ||
+          lower.includes('dentist') ||
+          lower.includes('name is') ||
+          lower.includes('my name') ||
+          lower.includes('please') ||
+          lower.includes('want to')
+        ) {
+          establishedLang = 'en';
           break;
         }
       }
@@ -1136,6 +1664,12 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
 
       console.log('[VOICE] sending audio to STT');
       console.log('[VOICE] STT request started');
+      const tSttStart = performance.now();
+      turnPerfRef.current.tSttStart = tSttStart;
+      console.log('[PERF] 4. STT request started');
+      if (turnPerfRef.current.tAudioBlob) {
+        console.log(`[PERF] blob → STT start: ${Math.round(tSttStart - turnPerfRef.current.tAudioBlob)}ms`);
+      }
 
       const res = await fetchWithTimeout(transcribeUrl, {
         method: 'POST',
@@ -1145,6 +1679,14 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
         body: audioBlob,
       }, 12000);
 
+      const tSttResponse = performance.now();
+      turnPerfRef.current.tSttResponse = tSttResponse;
+      console.log('[PERF] 5. STT response received');
+      if (turnPerfRef.current.tSttStart) {
+        const sttDuration = Math.round(tSttResponse - turnPerfRef.current.tSttStart);
+        console.log(`[PERF] STT start → STT response: ${sttDuration}ms`);
+        console.log(`[PERF] STT: ${sttDuration}ms`);
+      }
       console.log('[VOICE] STT response received');
 
       if (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
@@ -1158,11 +1700,28 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
       }
 
       const userText = data.transcript;
+      const tTranscript = performance.now();
+      turnPerfRef.current.tTranscript = tTranscript;
+      console.log('[PERF] 6. Transcript available');
       console.log('[VOICE] transcript received');
 
       if (!userText || !userText.trim()) {
         throw new Error('Could not understand speech. Please speak again.');
       }
+
+      if (sessionId !== recordingSessionIdRef.current || !voiceSessionActiveRef.current) {
+        console.warn(`[VOICE] Discarding transcribe response for inactive/stale session #${sessionId}`);
+        return;
+      }
+
+      // Immediately add and display user message in the conversation UI before AI processing
+      const userMsg: TranscriptMessage = {
+        role: 'user',
+        content: userText.trim(),
+        timestamp: new Date().toISOString(),
+      };
+      setTranscript((prev) => [...prev, userMsg]);
+      transcriptRef.current = [...transcriptRef.current, userMsg];
 
       await processUserMessage(userText.trim(), sessionId);
     } catch (err: unknown) {
@@ -1494,7 +2053,7 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
                       )}
                       {voiceSessionActive && voiceState === 'TRANSCRIBING' && 'Processing speech...'}
                       {voiceSessionActive && voiceState === 'THINKING' && 'Processing response...'}
-                      {voiceSessionActive && voiceState === 'SPEAKING' && 'Assistant speaking... (microphone paused)'}
+                      {voiceSessionActive && voiceState === 'SPEAKING' && 'Assistant speaking... (you can speak to interrupt)'}
                       {voiceSessionActive && voiceState === 'IDLE' && 'Call connected... preparing next turn'}
                       {voiceSessionActive && voiceState === 'ERROR' && (voiceError || 'Voice issue detected. Resuming call...')}
                     </span>
@@ -1546,6 +2105,7 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
                         <div className="flex items-center gap-2.5 px-5 py-3 rounded-full bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs font-bold shadow-xs">
                           <Volume2 className="w-4 h-4 animate-bounce text-indigo-600" />
                           <span>Assistant Speaking...</span>
+                          <span className="text-[10px] font-normal text-indigo-500 ml-1">(speak to interrupt)</span>
                         </div>
                       ) : voiceState === 'TRANSCRIBING' || voiceState === 'THINKING' ? (
                         <div className="flex items-center gap-2.5 px-5 py-3 rounded-full bg-slate-100 border border-slate-200 text-slate-700 text-xs font-semibold shadow-xs">
@@ -1575,7 +2135,7 @@ export function SimulatorView({ workflows }: SimulatorViewProps) {
 
                 <div className="text-center text-[10px] text-slate-400 font-medium">
                   {voiceSessionActive
-                    ? 'Hands-free call active. Speak naturally; the assistant detects pauses and responds automatically.'
+                    ? 'Hands-free call active. Speak naturally; pause to send, or speak while assistant is talking to interrupt.'
                     : 'Hands-free automated phone call. Supports English & Hindi/Hinglish.'}
                 </div>
               </div>
